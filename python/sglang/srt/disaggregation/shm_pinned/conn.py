@@ -329,9 +329,17 @@ class ShmPinnedKVManager(CommonKVManager):
                 reason = (
                     msg[3].decode("utf-8") if len(msg) > 3 else "Remote transfer failed"
                 )
-                self.record_failure(room, reason)
-                self.update_status(room, KVPoll.Failed)
+                applied = self.set_room_state_if_latest(
+                    room, session_id, KVPoll.Failed, reason
+                )
                 self._pop_pending_request(make_request_key(session_id, room))
+                if not applied:
+                    logger.info(
+                        "Ignore stale %s from prefill: room=%s session=%s",
+                        msg_type,
+                        room,
+                        session_id,
+                    )
             except Exception as e:
                 logger.error("Failed to handle decode control message: %s", e)
 
@@ -491,9 +499,18 @@ class ShmPinnedKVManager(CommonKVManager):
             session_id,
             room,
         )
-        if session_id:
-            self._pop_pending_request(make_request_key(session_id, room))
-        self.update_status(room, KVPoll.Failed)
+        if not session_id:
+            # Legacy ABORT without session_id: apply room-wide failure.
+            self.update_status(room, KVPoll.Failed)
+            return
+        # Apply Failed atomically under the latest-session guard before pop
+        # (pop clears latest for this session).
+        applied = self.set_room_state_if_latest(room, session_id, KVPoll.Failed)
+        self._pop_pending_request(make_request_key(session_id, room))
+        if not applied:
+            logger.info(
+                "Ignore stale ABORT: room=%s session=%s", room, session_id
+            )
 
     def _do_h2d_copy(
         self,
@@ -600,17 +617,22 @@ class ShmPinnedKVSender(CommonKVSender):
         super().init(num_kv_indices, aux_index)
 
     def _mark_failed(self, reason: str) -> None:
-        self.kv_mgr.record_failure(self.bootstrap_room, reason)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        if self.session_id is not None:
-            self.kv_mgr._pop_pending_request(
-                make_request_key(self.session_id, self.bootstrap_room)
-            )
-            self.kv_mgr._send_failure_to_decode(
-                self.session_id,
-                self.bootstrap_room,
-                reason,
-            )
+        if self.session_id is None:
+            # Never attached to a session; apply room-wide failure.
+            self.kv_mgr.record_failure(self.bootstrap_room, reason)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+        self.kv_mgr.set_room_state_if_latest(
+            self.bootstrap_room, self.session_id, KVPoll.Failed, reason
+        )
+        self.kv_mgr._pop_pending_request(
+            make_request_key(self.session_id, self.bootstrap_room)
+        )
+        self.kv_mgr._send_failure_to_decode(
+            self.session_id,
+            self.bootstrap_room,
+            reason,
+        )
 
     def _ensure_session_ready(self) -> bool:
         if self.session_engine is not None and self.dst_kv_indices is not None:
@@ -673,7 +695,9 @@ class ShmPinnedKVSender(CommonKVSender):
             )
 
             if self.curr_idx == 0:
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Transferring)
+                self.kv_mgr.set_room_state_if_latest(
+                    self.bootstrap_room, self.session_id, KVPoll.Transferring
+                )
 
             is_last = (self.curr_idx + len(kv_indices)) >= self.num_kv_indices
             if is_last and self._calculate_aux_bytes() > 0 and self.aux_index is None:
@@ -710,15 +734,20 @@ class ShmPinnedKVSender(CommonKVSender):
 
             self.curr_idx += len(kv_indices)
             if is_last and self.session_id is not None:
+                # Apply Success atomically under the latest-session guard
+                # before popping (pop clears latest if we still own it).
+                applied = self.kv_mgr.set_room_state_if_latest(
+                    self.bootstrap_room, self.session_id, KVPoll.Success
+                )
                 self.kv_mgr._pop_pending_request(
                     make_request_key(self.session_id, self.bootstrap_room)
                 )
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 logger.debug(
-                    "shm_pinned sender transfer complete: session=%s room=%s total_pages=%s",
+                    "shm_pinned sender transfer complete: session=%s room=%s total_pages=%s applied=%s",
                     self.session_id,
                     self.bootstrap_room,
                     self.curr_idx,
+                    applied,
                 )
         except Exception as e:
             self._mark_failed(str(e))
