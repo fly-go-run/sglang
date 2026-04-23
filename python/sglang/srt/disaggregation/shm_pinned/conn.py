@@ -75,6 +75,15 @@ class ShmPinnedKVManager(CommonKVManager):
         self.session_engines: Dict[str, ShmPinnedTransferEngine] = {}
         self.pending_requests: Dict[RequestKey, TransferRequest] = {}
         self.room_sessions: Dict[int, set[str]] = defaultdict(set)
+        # Tracks the session currently authoritative for a given room. The
+        # "latest" semantics is arrival-order based: whichever session's
+        # TRANSFER_REQ was most recently handed to _add_pending_request wins
+        # the room. Room reuse is expected to happen via decode restart and
+        # SGLang does not route a single bootstrap_room across concurrent
+        # decode managers, so arrival order lines up with session freshness
+        # in practice. If that assumption ever breaks (e.g. out-of-order ZMQ
+        # delivery across distinct decode connections), this dict would need
+        # an explicit generation / timestamp comparison.
         self.latest_session_for_room: Dict[int, str] = {}
         self.pending_lock = threading.Lock()
         self.decode_connections: Dict[str, tuple[object, threading.Lock]] = {}
@@ -129,7 +138,6 @@ class ShmPinnedKVManager(CommonKVManager):
 
     def _add_pending_request(self, req: TransferRequest) -> None:
         key = make_request_key(req.session_id, req.room)
-        prev_latest_changed = False
         with self.pending_lock:
             prev_latest = self.latest_session_for_room.get(req.room)
             prev_latest_changed = prev_latest != req.session_id
@@ -155,13 +163,12 @@ class ShmPinnedKVManager(CommonKVManager):
             self.latest_session_for_room[req.room] = req.session_id
 
             if prev_latest_changed:
-                # Reset status inside the lock so no writer sees a window where
-                # latest has switched but the old terminal state is still set.
+                # Reset status and clear stale failure reason under the same
+                # pending_lock so no observer sees a window where latest has
+                # switched but the old terminal state/reason is still set.
                 self.request_status[req.room] = KVPoll.Bootstrapping
-
-        if prev_latest_changed:
-            with self.failure_lock:
-                self.failure_records.pop(req.room, None)
+                with self.failure_lock:
+                    self.failure_records.pop(req.room, None)
 
     def _pop_pending_request(self, key: RequestKey) -> Optional[TransferRequest]:
         with self.pending_lock:
@@ -211,6 +218,10 @@ class ShmPinnedKVManager(CommonKVManager):
 
         Stale updates from older sessions that lost the room to a retry are
         silently ignored. Returns True if the update was applied.
+
+        failure_reason is written under pending_lock alongside the status
+        update so that once poll() sees the new status, failure_exception()
+        is guaranteed to see the matching reason.
         """
         if not session_id:
             return False
@@ -224,9 +235,9 @@ class ShmPinnedKVManager(CommonKVManager):
                     status,
                 )
                 return False
+            if reason is not None:
+                self.record_failure(room, reason)
             self.update_status(room, status)
-        if reason is not None:
-            self.record_failure(room, reason)
         return True
 
     def get_status(self, room: int) -> KVPoll:
@@ -385,8 +396,15 @@ class ShmPinnedKVManager(CommonKVManager):
 
                 def fail(reason: str) -> None:
                     nonlocal slot_released
-                    self.record_failure(meta.room, reason)
-                    self.update_status(meta.room, KVPoll.Failed)
+                    # Gate under latest-session even though a single decode
+                    # manager only ever has one session_id; keeps control and
+                    # completion paths symmetric.
+                    self.set_room_state_if_latest(
+                        meta.room,
+                        self.engine.session_id,
+                        KVPoll.Failed,
+                        reason,
+                    )
                     self._pop_pending_request(key)
                     if not slot_released:
                         self.engine.post_free(slot_idx)
@@ -422,8 +440,12 @@ class ShmPinnedKVManager(CommonKVManager):
                     req.last_chunk_seen = True
 
                 if req.received_pages == total_pages and req.last_chunk_seen:
+                    # Apply Success atomically under the latest-session guard
+                    # before pop (pop clears latest if we still own it).
+                    self.set_room_state_if_latest(
+                        meta.room, self.engine.session_id, KVPoll.Success
+                    )
                     self._pop_pending_request(key)
-                    self.update_status(meta.room, KVPoll.Success)
                     logger.debug(
                         "shm_pinned decode transfer complete: session=%s room=%s total_pages=%s",
                         self.engine.session_id,

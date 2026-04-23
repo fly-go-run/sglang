@@ -284,6 +284,61 @@ def test_set_room_state_if_latest_blocks_stale_writes():
     assert mgr.get_status(room) == KVPoll.Success
 
 
+def test_set_room_state_if_latest_writes_status_and_reason_atomically():
+    """When set_room_state_if_latest(reason=...) returns True the failure
+    message must already be visible; otherwise failure_exception() can read
+    None while poll() already reports Failed."""
+    mgr = _make_bare_manager()
+    room = 31
+    req = TransferRequest(
+        room=room,
+        session_id="s",
+        dst_kv_indices=np.array([0], dtype=np.int32),
+        engine=object(),
+        total_pages=1,
+    )
+    mgr._add_pending_request(req)
+
+    assert (
+        mgr.set_room_state_if_latest(room, "s", KVPoll.Failed, "boom") is True
+    )
+    # Both sides of the tuple must be observable the instant the helper
+    # returns. A single-threaded assertion can't catch every interleaving
+    # but it verifies the code path writes the reason before releasing
+    # pending_lock and therefore before poll() can observe Failed.
+    assert mgr.get_status(room) == KVPoll.Failed
+    assert mgr.get_failure_message(room) == "boom"
+
+
+def test_latest_switch_clears_stale_failure_reason():
+    """A new session taking over a reused room must clear the old
+    session's failure reason, not just reset request_status."""
+    mgr = _make_bare_manager()
+    room = 41
+
+    old_req = TransferRequest(
+        room=room,
+        session_id="old",
+        dst_kv_indices=np.array([0], dtype=np.int32),
+        engine=object(),
+        total_pages=1,
+    )
+    mgr._add_pending_request(old_req)
+    mgr.set_room_state_if_latest(room, "old", KVPoll.Failed, "old boom")
+    assert mgr.get_failure_message(room) == "old boom"
+
+    new_req = TransferRequest(
+        room=room,
+        session_id="new",
+        dst_kv_indices=np.array([1], dtype=np.int32),
+        engine=object(),
+        total_pages=1,
+    )
+    mgr._add_pending_request(new_req)
+    assert mgr.get_status(room) == KVPoll.Bootstrapping
+    assert mgr.get_failure_message(room) is None
+
+
 if __name__ == "__main__":
     import sys
 
