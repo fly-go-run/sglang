@@ -75,6 +75,7 @@ class ShmPinnedKVManager(CommonKVManager):
         self.session_engines: Dict[str, ShmPinnedTransferEngine] = {}
         self.pending_requests: Dict[RequestKey, TransferRequest] = {}
         self.room_sessions: Dict[int, set[str]] = defaultdict(set)
+        self.latest_session_for_room: Dict[int, str] = {}
         self.pending_lock = threading.Lock()
         self.decode_connections: Dict[str, tuple[object, threading.Lock]] = {}
 
@@ -128,9 +129,39 @@ class ShmPinnedKVManager(CommonKVManager):
 
     def _add_pending_request(self, req: TransferRequest) -> None:
         key = make_request_key(req.session_id, req.room)
+        prev_latest_changed = False
         with self.pending_lock:
+            prev_latest = self.latest_session_for_room.get(req.room)
+            prev_latest_changed = prev_latest != req.session_id
+
+            stale_sessions = [
+                sid
+                for sid in self.room_sessions.get(req.room, set())
+                if sid != req.session_id
+            ]
+            for stale_sid in stale_sessions:
+                self.pending_requests.pop(
+                    make_request_key(stale_sid, req.room), None
+                )
+            if stale_sessions:
+                room_set = self.room_sessions.get(req.room)
+                if room_set is not None:
+                    room_set.difference_update(stale_sessions)
+                    if not room_set:
+                        self.room_sessions.pop(req.room, None)
+
             self.pending_requests[key] = req
             self.room_sessions[req.room].add(req.session_id)
+            self.latest_session_for_room[req.room] = req.session_id
+
+            if prev_latest_changed:
+                # Reset status inside the lock so no writer sees a window where
+                # latest has switched but the old terminal state is still set.
+                self.request_status[req.room] = KVPoll.Bootstrapping
+
+        if prev_latest_changed:
+            with self.failure_lock:
+                self.failure_records.pop(req.room, None)
 
     def _pop_pending_request(self, key: RequestKey) -> Optional[TransferRequest]:
         with self.pending_lock:
@@ -142,6 +173,8 @@ class ShmPinnedKVManager(CommonKVManager):
                 sessions.discard(req.session_id)
                 if not sessions:
                     self.room_sessions.pop(req.room, None)
+            if self.latest_session_for_room.get(req.room) == req.session_id:
+                self.latest_session_for_room.pop(req.room, None)
             return req
 
     def get_pending_request(
@@ -150,13 +183,51 @@ class ShmPinnedKVManager(CommonKVManager):
         with self.pending_lock:
             return self.pending_requests.get(make_request_key(session_id, room))
 
-    def get_pending_request_for_room(self, room: int) -> Optional[TransferRequest]:
+    def get_latest_pending_request_for_room(
+        self, room: int
+    ) -> Optional[TransferRequest]:
         with self.pending_lock:
-            sessions = self.room_sessions.get(room)
-            if not sessions or len(sessions) != 1:
+            session_id = self.latest_session_for_room.get(room)
+            if session_id is None:
                 return None
-            session_id = next(iter(sessions))
             return self.pending_requests.get(make_request_key(session_id, room))
+
+    def is_latest_session_for_room(
+        self, room: int, session_id: Optional[str]
+    ) -> bool:
+        if not session_id:
+            return False
+        with self.pending_lock:
+            return self.latest_session_for_room.get(room) == session_id
+
+    def set_room_state_if_latest(
+        self,
+        room: int,
+        session_id: Optional[str],
+        status: KVPoll,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Apply a room-level state update only if session_id still owns the room.
+
+        Stale updates from older sessions that lost the room to a retry are
+        silently ignored. Returns True if the update was applied.
+        """
+        if not session_id:
+            return False
+        with self.pending_lock:
+            if self.latest_session_for_room.get(room) != session_id:
+                logger.info(
+                    "Ignore stale room update: room=%s session=%s latest=%s status=%s",
+                    room,
+                    session_id,
+                    self.latest_session_for_room.get(room),
+                    status,
+                )
+                return False
+            self.update_status(room, status)
+        if reason is not None:
+            self.record_failure(room, reason)
+        return True
 
     def get_status(self, room: int) -> KVPoll:
         return self.request_status.get(room, KVPoll.Failed)
@@ -548,7 +619,7 @@ class ShmPinnedKVSender(CommonKVSender):
         req = (
             self.kv_mgr.get_pending_request(self.session_id, self.bootstrap_room)
             if self.session_id is not None
-            else self.kv_mgr.get_pending_request_for_room(self.bootstrap_room)
+            else self.kv_mgr.get_latest_pending_request_for_room(self.bootstrap_room)
         )
         if req is None:
             return False
