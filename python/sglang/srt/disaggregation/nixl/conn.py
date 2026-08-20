@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import struct
 import threading
 import time
@@ -27,6 +28,29 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     StagingRegisterInfo,
+)
+
+# Hard cap on how long one chunk may wait for the decode ring watermark. A
+# watermark that stays frozen this long means the decode side is stuck or the
+# WATERMARK notifications are lost; keeping the chunk in the retry loop only
+# extends the outage (2026-08-20: chunks re-queued for 400+s until the pod
+# watchdog restarted both prefills). Failing the request routes the room
+# through the transfer worker's existing record_failure/Failed path, so the
+# damage stays request-scoped. Keep this above the decode-side
+# SGLANG_DISAGG_STAGING_STALL_TIMEOUT_S (default 60s): the decode stall guard
+# frees the ring first, and this raise only fires if decode never recovers.
+STAGING_WATERMARK_STALL_TIMEOUT_S = float(
+    os.environ.get("SGLANG_DISAGG_STAGING_WATERMARK_STALL_TIMEOUT_S", "90")
+)
+
+# Hard cap on busy-polling NIXL transfer handles. Must stay BELOW the
+# decode-side SGLANG_DISAGG_STAGING_STALL_TIMEOUT_S (default 60s): when a
+# handle hangs (e.g. a peer stops draining), the prefill must cancel its
+# in-flight writes BEFORE decode's stall guard frees and eventually reuses
+# the target staging allocations, otherwise a late RDMA write could land in
+# another room's slot.
+STAGING_HANDLE_WAIT_TIMEOUT_S = float(
+    os.environ.get("SGLANG_DISAGG_STAGING_HANDLE_WAIT_TIMEOUT_S", "45")
 )
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
@@ -1258,6 +1282,27 @@ class NixlKVManager(CommonKVManager):
                             kv_chunk.is_last_chunk,
                         )
                         next_handle_log_s += 10.0
+                    if elapsed_s > STAGING_HANDLE_WAIT_TIMEOUT_S:
+                        # Cancel our writes before the decode-side stall guard
+                        # (60s) frees the target allocations for reuse; then
+                        # fail just this room via the worker's except path.
+                        for handle in handles:
+                            try:
+                                if self.agent.check_xfer_state(handle) != "DONE":
+                                    self.agent.release_xfer_handle(handle)
+                            except Exception:
+                                logger.exception(
+                                    "[STAGING_HANDLE_TIMEOUT] cancel failed "
+                                    "room=%s",
+                                    room,
+                                )
+                        raise RuntimeError(
+                            f"[STAGING_HANDLE_TIMEOUT] room={room} NIXL "
+                            f"transfer not DONE after {elapsed_s:.0f}s "
+                            f"(pending={pending_count}/{len(handles)}, "
+                            f"last_chunk={kv_chunk.is_last_chunk}); cancelled "
+                            f"in-flight transfers and failed the request."
+                        )
                     time.sleep(0)
 
                 if kv_chunk.is_last_chunk:
@@ -1806,6 +1851,16 @@ class NixlKVManager(CommonKVManager):
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
             now = time.monotonic()
+            remote_wm = self._staging_ctx.remote_watermarks.get(
+                req.agent_name, (0, 0)
+            )
+            # An advancing watermark means backlog (decode is draining, we
+            # just have not caught up yet), not a stall: restart the clock so
+            # only a FROZEN watermark can accumulate toward the timeout.
+            prev_wm = self._staging_ctx.watermark_wait_last_wm.get(wait_key)
+            if prev_wm is not None and prev_wm != remote_wm:
+                self._staging_ctx.watermark_wait_started[wait_key] = now
+            self._staging_ctx.watermark_wait_last_wm[wait_key] = remote_wm
             wait_started = self._staging_ctx.watermark_wait_started.setdefault(
                 wait_key, now
             )
@@ -1813,10 +1868,23 @@ class NixlKVManager(CommonKVManager):
                 wait_key, wait_started
             )
             elapsed_s = now - wait_started
-            if elapsed_s >= 5.0 and now - last_log >= 5.0:
-                remote_wm = self._staging_ctx.remote_watermarks.get(
-                    req.agent_name, (0, 0)
+            if elapsed_s > STAGING_WATERMARK_STALL_TIMEOUT_S:
+                self._staging_ctx.watermark_wait_started.pop(wait_key, None)
+                self._staging_ctx.watermark_wait_last_log.pop(wait_key, None)
+                self._staging_ctx.watermark_wait_last_wm.pop(wait_key, None)
+                # Raising fails only this room: the transfer worker's
+                # except-handler records the failure and marks the room
+                # Failed. Do NOT re-enqueue -- the frozen watermark would
+                # just keep the chunk bouncing until a pod-level watchdog
+                # restarts the whole worker.
+                raise RuntimeError(
+                    f"[STAGING_WATERMARK_STALL] room={kv_chunk.room} "
+                    f"chunk={chunk_idx} watermark frozen for {elapsed_s:.0f}s "
+                    f"(alloc_round={c_round} alloc_end={c_end} "
+                    f"remote_wm={remote_wm}); failing the request instead of "
+                    f"blocking indefinitely."
                 )
+            if elapsed_s >= 5.0 and now - last_log >= 5.0:
                 logger.warning(
                     "[STAGING_WAIT_WATERMARK] room=%s chunk=%s elapsed_s=%.3f "
                     "alloc_round=%s alloc_end=%s remote_wm=%s",
@@ -1835,6 +1903,7 @@ class NixlKVManager(CommonKVManager):
 
         self._staging_ctx.watermark_wait_started.pop(wait_key, None)
         self._staging_ctx.watermark_wait_last_log.pop(wait_key, None)
+        self._staging_ctx.watermark_wait_last_wm.pop(wait_key, None)
 
         notif_tag = (
             f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
