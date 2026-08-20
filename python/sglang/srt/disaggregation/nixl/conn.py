@@ -24,7 +24,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
-from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
+from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_WATERMARK_WAIT_S,
+    StagingRegisterInfo,
+)
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -450,7 +453,7 @@ class NixlKVManager(CommonKVManager):
                 )
                 threading.Thread(
                     target=self.transfer_worker,
-                    args=(queue, staging_buffer),
+                    args=(queue, staging_buffer, i),
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
@@ -531,6 +534,34 @@ class NixlKVManager(CommonKVManager):
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
+
+    def _handle_node_failure(self, failed_bootstrap_addr: str):
+        """Run common failure handling and retire only the failed generation.
+
+        Snapshot subscriber generations before CommonKVManager removes the
+        connection-pool entries. If a replacement prefill registers on the
+        same endpoints concurrently, its newer generation survives cleanup.
+        """
+        subscriber_tokens = []
+        handler = getattr(self, "_staging_handler", None)
+        if self.enable_staging and handler is not None:
+            with self.connection_lock:
+                bootstrap_info_groups = [
+                    list(self.connection_pool[key])
+                    for key in self.connection_pool
+                    if key.startswith(failed_bootstrap_addr)
+                ]
+            subscriber_tokens = handler.snapshot_wm_subscribers(
+                bootstrap_info_groups
+            )
+
+        super()._handle_node_failure(failed_bootstrap_addr)
+
+        if subscriber_tokens and handler is not None:
+            handler.unregister_wm_subscribers(
+                subscriber_tokens,
+                reason=f"node-failure:{failed_bootstrap_addr}",
+            )
 
     def _is_watermark_ready(
         self, agent_name: str, alloc_round: int, alloc_end: int
@@ -1003,7 +1034,7 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
-    def transfer_worker(self, queue: FastQueue, staging_buffer=None):
+    def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_idx=-1):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
@@ -1017,7 +1048,15 @@ class NixlKVManager(CommonKVManager):
                 if self.check_status(room) == KVPoll.Failed:
                     continue
 
-                assert room in self.transfer_infos
+                if room not in self.transfer_infos:
+                    # Abort cleanup may legally remove a room after its final
+                    # chunk was queued.  Treat the queued chunk as stale.
+                    logger.info(
+                        "[STAGING_STALE_ROOM] worker=%s room=%s action=skip",
+                        worker_idx,
+                        room,
+                    )
+                    continue
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1190,8 +1229,11 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                handle_wait_started = time.monotonic()
+                next_handle_log_s = 5.0
                 while handles:
                     all_done = True
+                    pending_count = 0
                     for handle in handles:
                         state = self.agent.check_xfer_state(handle)
                         if state == "ERR":
@@ -1200,8 +1242,22 @@ class NixlKVManager(CommonKVManager):
                             )
                         if state != "DONE":
                             all_done = False
+                            pending_count += 1
                     if all_done:
                         break
+                    elapsed_s = time.monotonic() - handle_wait_started
+                    if elapsed_s >= next_handle_log_s:
+                        logger.warning(
+                            "[STAGING_WAIT_HANDLE] worker=%s room=%s "
+                            "elapsed_s=%.3f pending=%s total=%s last_chunk=%s",
+                            worker_idx,
+                            room,
+                            elapsed_s,
+                            pending_count,
+                            len(handles),
+                            kv_chunk.is_last_chunk,
+                        )
+                        next_handle_log_s += 10.0
                     time.sleep(0)
 
                 if kv_chunk.is_last_chunk:
@@ -1212,11 +1268,9 @@ class NixlKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
                         self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
+                        for k in list(self._staging_ctx.prefetch_requested):
+                            if k[0] == room:
+                                self._staging_ctx.prefetch_requested.discard(k)
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
@@ -1735,9 +1789,10 @@ class NixlKVManager(CommonKVManager):
         page_start = kv_chunk.index_slice.start
         num_pages = len(kv_chunk.prefill_kv_indices)
 
-        ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+        ready, chunk_idx, c_offset, c_round, c_end = staging_strategy.check_ready(
             req, page_start, num_pages, session_id=req.agent_name
         )
+        wait_key = (kv_chunk.room, chunk_idx, req.agent_name)
         if not ready:
             from sglang.srt.disaggregation.common.staging_buffer import (
                 StagingAllocator,
@@ -1750,8 +1805,36 @@ class NixlKVManager(CommonKVManager):
                     f"(room={kv_chunk.room}). Increase "
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
+            now = time.monotonic()
+            wait_started = self._staging_ctx.watermark_wait_started.setdefault(
+                wait_key, now
+            )
+            last_log = self._staging_ctx.watermark_wait_last_log.get(
+                wait_key, wait_started
+            )
+            elapsed_s = now - wait_started
+            if elapsed_s >= 5.0 and now - last_log >= 5.0:
+                remote_wm = self._staging_ctx.remote_watermarks.get(
+                    req.agent_name, (0, 0)
+                )
+                logger.warning(
+                    "[STAGING_WAIT_WATERMARK] room=%s chunk=%s elapsed_s=%.3f "
+                    "alloc_round=%s alloc_end=%s remote_wm=%s",
+                    kv_chunk.room,
+                    chunk_idx,
+                    elapsed_s,
+                    c_round,
+                    c_end,
+                    remote_wm,
+                )
+                self._staging_ctx.watermark_wait_last_log[wait_key] = now
+            with self._staging_ctx.watermark_cv:
+                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
             queue.put(kv_chunk)
             return (None, True)
+
+        self._staging_ctx.watermark_wait_started.pop(wait_key, None)
+        self._staging_ctx.watermark_wait_last_log.pop(wait_key, None)
 
         notif_tag = (
             f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
@@ -1770,6 +1853,13 @@ class NixlKVManager(CommonKVManager):
             notif_tag,
             staging_buffer=staging_strategy.staging_buffer,
         )
+        if handle is None:
+            raise RuntimeError(
+                f"[Staging] staged transfer cannot fit chunk "
+                f"(room={kv_chunk.room}, chunk_idx={chunk_idx}, "
+                f"pages={num_pages}); increase the staging pool or reduce "
+                f"chunked_prefill_size"
+            )
         return (handle, False)
 
     def send_aux(

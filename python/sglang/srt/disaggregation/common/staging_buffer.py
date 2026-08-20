@@ -194,6 +194,9 @@ class StagingAllocator:
         self.watermark_round = 0
         self.watermark_tail = 0
         self.lock = threading.Lock()
+        # Lazily created by the first decode-side scatter.  Keeping the
+        # attribute present lets abort cleanup safely drain in-flight work.
+        self._scatter_stream = None
 
         logger.info(
             f"StagingAllocator (ring+overcommit): "

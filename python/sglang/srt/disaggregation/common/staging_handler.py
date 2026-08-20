@@ -12,11 +12,25 @@ import dataclasses
 import logging
 import struct
 import threading
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Avoid a tight dequeue/requeue loop while the prefill waits for the decode
+# ring watermark to advance.
+STAGING_WATERMARK_WAIT_S = 0.001
+
+# Decode must never synchronously send control-plane messages from the scheduler
+# thread. A dead or backpressured prefill peer can otherwise freeze decode and
+# every connected prefill group. The sender below coalesces each subscriber to
+# its newest watermark and retries outside the scheduler thread.
+STAGING_WATERMARK_SEND_RETRY_S = 0.001
+STAGING_WATERMARK_SEND_WARN_AFTER_S = 5.0
+STAGING_WATERMARK_SEND_WARN_EVERY_S = 30.0
+STAGING_WATERMARK_SEND_ERROR_EVERY_S = 30.0
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -51,6 +65,9 @@ class PrefillStagingContext:
     # to short-circuit per-room prefetch entry on every chunk after the first.
     prefetched_rooms: set = dataclasses.field(default_factory=set)
     prefetch_sockets: dict = dataclasses.field(default_factory=dict)
+    # Diagnostic timestamps for a chunk waiting on the remote ring watermark.
+    watermark_wait_started: dict = dataclasses.field(default_factory=dict)
+    watermark_wait_last_log: dict = dataclasses.field(default_factory=dict)
 
 
 class DecodeStagingHandler:
@@ -79,15 +96,242 @@ class DecodeStagingHandler:
         self.tp_rank = tp_rank
         self.scheduler = scheduler
         self._room_to_decode_req: dict = {}
+        # Failure paths clear decode_req.kv_receiver before unregistering the
+        # room, so retain the receiver needed to release staging allocations.
+        self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
+        self._wm_next_generation = 0
+        self._wm_send_cv = threading.Condition()
+        self._wm_send_pending: dict = {}
+        self._wm_send_wait_started: dict = {}
+        self._wm_send_last_log: dict = {}
+        self._wm_send_error_last_log: dict = {}
+        threading.Thread(
+            target=self._watermark_sender_loop,
+            daemon=True,
+            name="staging-watermark-sender",
+        ).start()
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
-        """Register a prefill's bootstrap connection for watermark broadcasts."""
+        """Register or refresh a prefill watermark subscriber.
+
+        A new session on the same endpoints bumps the generation. Sender work
+        captured for the old generation is then discarded instead of being
+        requeued onto the replacement receiver.
+        """
         if receiver is None or not getattr(receiver, "bootstrap_infos", None):
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
-        if key not in self._wm_subscribers:
-            self._wm_subscribers[key] = (receiver, session_id)
+        with self._wm_send_cv:
+            previous = self._wm_subscribers.get(key)
+            if previous is None or previous[1] != session_id:
+                self._wm_next_generation += 1
+                generation = self._wm_next_generation
+                self._wm_subscribers[key] = (receiver, session_id, generation)
+                wm_round, wm_tail = self.staging_allocator.get_watermark()
+                self._wm_send_pending[key] = (
+                    receiver,
+                    session_id,
+                    wm_round,
+                    wm_tail,
+                    generation,
+                )
+                logger.info(
+                    "STAGING_WATERMARK_SUBSCRIBER_REGISTER subscriber=%s "
+                    "session=%s generation=%s replaced=%s",
+                    key,
+                    session_id,
+                    generation,
+                    previous is not None,
+                )
+            else:
+                # A receiver is request-scoped in this integration. Refresh it
+                # without bumping generation when the peer session is unchanged.
+                generation = previous[2]
+                self._wm_subscribers[key] = (receiver, session_id, generation)
+                pending = self._wm_send_pending.get(key)
+                if pending is not None and pending[4] == generation:
+                    self._wm_send_pending[key] = (
+                        receiver,
+                        session_id,
+                        pending[2],
+                        pending[3],
+                        generation,
+                    )
+            self._wm_send_cv.notify()
+
+    def snapshot_wm_subscribers(self, bootstrap_info_groups) -> list:
+        """Capture generation-guarded subscriber tokens for node cleanup."""
+        keys = {
+            tuple(str(bootstrap_info) for bootstrap_info in bootstrap_infos)
+            for bootstrap_infos in bootstrap_info_groups
+            if bootstrap_infos
+        }
+        with self._wm_send_cv:
+            return [
+                (key, self._wm_subscribers[key][2])
+                for key in keys
+                if key in self._wm_subscribers
+            ]
+
+    def unregister_wm_subscribers(self, subscriber_tokens, reason: str) -> None:
+        """Remove only subscribers whose captured generation is still active."""
+        removed = []
+        with self._wm_send_cv:
+            for key, generation in subscriber_tokens:
+                active = self._wm_subscribers.get(key)
+                if active is None or active[2] != generation:
+                    continue
+                self._wm_subscribers.pop(key, None)
+                pending = self._wm_send_pending.get(key)
+                if pending is not None and pending[4] == generation:
+                    self._wm_send_pending.pop(key, None)
+                token = (key, generation)
+                self._wm_send_wait_started.pop(token, None)
+                self._wm_send_last_log.pop(token, None)
+                self._wm_send_error_last_log.pop(token, None)
+                removed.append((key, active[1], generation))
+            self._wm_send_cv.notify()
+        for key, session_id, generation in removed:
+            logger.info(
+                "STAGING_WATERMARK_SUBSCRIBER_REMOVE subscriber=%s "
+                "session=%s generation=%s reason=%s",
+                key,
+                session_id,
+                generation,
+                reason,
+            )
+
+    def _queue_watermark_broadcast(self, wm_round: int, wm_tail: int) -> None:
+        """Queue only the newest watermark for every known prefill peer."""
+        with self._wm_send_cv:
+            for key, (
+                receiver,
+                session_id,
+                generation,
+            ) in self._wm_subscribers.items():
+                self._wm_send_pending[key] = (
+                    receiver,
+                    session_id,
+                    wm_round,
+                    wm_tail,
+                    generation,
+                )
+            self._wm_send_cv.notify()
+
+    def _requeue_watermark(self, key, item) -> bool:
+        """Retry a failed send without replacing a newer queued watermark."""
+        with self._wm_send_cv:
+            active = self._wm_subscribers.get(key)
+            generation = item[4]
+            if active is None or active[2] != generation:
+                return False
+            retry_item = (active[0], active[1], item[2], item[3], generation)
+            current = self._wm_send_pending.get(key)
+            if (
+                current is None
+                or current[4] != generation
+                or (current[2], current[3]) < (item[2], item[3])
+            ):
+                self._wm_send_pending[key] = retry_item
+            self._wm_send_cv.notify()
+            return True
+
+    def _watermark_sender_loop(self) -> None:
+        """Send watermarks off-thread without blocking on ZMQ backpressure."""
+        import zmq
+
+        while True:
+            with self._wm_send_cv:
+                while not self._wm_send_pending:
+                    self._wm_send_cv.wait()
+                pending = list(self._wm_send_pending.items())
+                self._wm_send_pending.clear()
+
+            retry_needed = False
+            for key, item in pending:
+                receiver, session_id, wm_round, wm_tail, generation = item
+                with self._wm_send_cv:
+                    active = self._wm_subscribers.get(key)
+                    if active is None or active[2] != generation:
+                        continue
+                    # Use the freshest request-scoped receiver for this peer.
+                    receiver, session_id, generation = active
+                token = (key, generation)
+                message = [
+                    b"WATERMARK",
+                    str(wm_round).encode("ascii"),
+                    str(wm_tail).encode("ascii"),
+                    session_id.encode("ascii"),
+                ]
+                delivered = True
+                for bootstrap_info in receiver.bootstrap_infos:
+                    lock = None
+                    acquired = False
+                    try:
+                        sock, lock = receiver._connect_to_bootstrap_server(
+                            bootstrap_info
+                        )
+                        acquired = lock.acquire(timeout=0.01)
+                        if not acquired:
+                            delivered = False
+                            continue
+                        sock.send_multipart(message, flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        delivered = False
+                    except Exception:
+                        delivered = False
+                        now = time.monotonic()
+                        last_error_log = self._wm_send_error_last_log.get(token, 0.0)
+                        if (
+                            now - last_error_log
+                            >= STAGING_WATERMARK_SEND_ERROR_EVERY_S
+                        ):
+                            logger.exception(
+                                "STAGING_WATERMARK_SEND_ERROR subscriber=%s "
+                                "session=%s generation=%s watermark=(%s,%s)",
+                                key,
+                                session_id,
+                                generation,
+                                wm_round,
+                                wm_tail,
+                            )
+                            self._wm_send_error_last_log[token] = now
+                    finally:
+                        if acquired and lock is not None:
+                            lock.release()
+
+                if delivered:
+                    self._wm_send_wait_started.pop(token, None)
+                    self._wm_send_last_log.pop(token, None)
+                    self._wm_send_error_last_log.pop(token, None)
+                    continue
+
+                if not self._requeue_watermark(key, item):
+                    continue
+                retry_needed = True
+                now = time.monotonic()
+                started = self._wm_send_wait_started.setdefault(token, now)
+                last_log = self._wm_send_last_log.get(token, 0.0)
+                if (
+                    now - started >= STAGING_WATERMARK_SEND_WARN_AFTER_S
+                    and now - last_log >= STAGING_WATERMARK_SEND_WARN_EVERY_S
+                ):
+                    logger.warning(
+                        "STAGING_WATERMARK_SEND_BLOCKED subscriber=%s "
+                        "session=%s generation=%s watermark=(%s,%s) waited=%.1fs; "
+                        "coalescing and retrying off scheduler thread",
+                        key,
+                        session_id,
+                        generation,
+                        wm_round,
+                        wm_tail,
+                        now - started,
+                    )
+                    self._wm_send_last_log[token] = now
+
+            if retry_needed:
+                time.sleep(STAGING_WATERMARK_SEND_RETRY_S)
 
     def num_writers_for(self, decode_req) -> int:
         """Compute num_writers for a specific request based on its prefill TP."""
@@ -133,10 +377,59 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def register_decode_req(self, room: int, decode_req: DecodeRequest) -> None:
+        decode_req._staging_scatter_done = False
+        decode_req._chunk_events = []
         self._room_to_decode_req[room] = decode_req
+        self._room_to_receiver[room] = decode_req.kv_receiver
 
     def unregister_decode_req(self, room: int) -> None:
-        self._room_to_decode_req.pop(room, None)
+        # Remove visibility first so no new arrival starts consuming a room
+        # while its failure/abort cleanup is in progress.
+        decode_req = self._room_to_decode_req.pop(room, None)
+        receiver = self._room_to_receiver.pop(room, None)
+        if decode_req is not None:
+            self.release_room(room, decode_req, receiver)
+        self.kv_manager._staging_ctx.room_receivers.pop(room, None)
+        self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+        if hasattr(self.kv_manager, "_chunk_writer_counts"):
+            self.kv_manager._chunk_writer_counts.pop(room, None)
+
+    def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
+        """Release allocations left by a failed or aborted staging room."""
+        # A scatter may have launched immediately before unregister.  Drain the
+        # stream before freeing its source slot or the destination KV pages.
+        stream = self.staging_allocator._scatter_stream
+        if stream is not None:
+            stream.synchronize()
+
+        chunk_infos = (
+            getattr(receiver, "chunk_staging_infos", [])
+            if receiver is not None
+            else []
+        )
+        unscattered_allocs = []
+        for chunk_idx, info in enumerate(chunk_infos):
+            if info[0] >= 0:
+                unscattered_allocs.append((chunk_idx, info[0]))
+                chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+
+        for chunk_idx, alloc_id in unscattered_allocs:
+            logger.warning(
+                "[STAGING_RELEASE] room=%s chunk=%s alloc_id=%s reason=unscattered",
+                room,
+                chunk_idx,
+                alloc_id,
+            )
+            self._free_and_send_watermark(alloc_id, decode_req)
+
+        for _event, alloc_id in decode_req._chunk_events:
+            logger.warning(
+                "[STAGING_RELEASE] room=%s alloc_id=%s reason=pending-scatter",
+                room,
+                alloc_id,
+            )
+            self._free_and_send_watermark(alloc_id, decode_req)
+        decode_req._chunk_events.clear()
 
     # ------------------------------------------------------------------
     # Scatter submission: called from decode_thread (background)
@@ -160,7 +453,8 @@ class DecodeStagingHandler:
                 chunk_idx,
             )
             return False
-        chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+        receiver = self._room_to_receiver.get(room)
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         if chunk_idx >= len(chunk_infos):
             return False
         alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
@@ -171,8 +465,6 @@ class DecodeStagingHandler:
         if ok:
             event = torch.cuda.Event()
             event.record(self.staging_allocator._scatter_stream)
-            if not hasattr(decode_req, "_chunk_events"):
-                decode_req._chunk_events = []
             decode_req._chunk_events.append((event, alloc_id))
             chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
         else:
@@ -253,9 +545,7 @@ class DecodeStagingHandler:
 
     def is_done(self, decode_req: DecodeRequest) -> bool:
         """Return True if staging scatter is complete for this request."""
-        if not getattr(decode_req, "_staging_scatter_done", False):
-            return False
-        return not getattr(decode_req, "_chunk_events", None)
+        return decode_req._staging_scatter_done and not decode_req._chunk_events
 
     def advance_scatter(self, decode_req: DecodeRequest) -> None:
         """Check CUDA events and free completed staging allocations.
@@ -265,7 +555,7 @@ class DecodeStagingHandler:
         method only polls the recorded events and releases staging memory.
         """
         room = decode_req.req.bootstrap_room
-        chunk_events = getattr(decode_req, "_chunk_events", None)
+        chunk_events = decode_req._chunk_events
         if chunk_events:
             for i in range(len(chunk_events) - 1, -1, -1):
                 event, alloc_id = chunk_events[i]
@@ -278,7 +568,22 @@ class DecodeStagingHandler:
 
         event = getattr(decode_req, "_scatter_event", None)
         if event is not None and event.query():
-            self._free_and_send_watermark(decode_req._scatter_alloc_id, decode_req)
+            alloc_id = decode_req._scatter_alloc_id
+            # The last chunk is tracked by _scatter_event instead of
+            # _chunk_events.  Mark its receiver slot consumed once the event
+            # completes, otherwise normal unregister mistakes the already
+            # freed allocation for an abort leak and broadcasts a duplicate
+            # watermark.  Before completion the slot remains live so abort
+            # cleanup can still find and release it safely.
+            receiver = self._room_to_receiver.get(room)
+            chunk_infos = (
+                getattr(receiver, "chunk_staging_infos", [])
+                if receiver is not None
+                else []
+            )
+            if chunk_infos and chunk_infos[-1][0] == alloc_id:
+                chunk_infos[-1] = (-1, -1, 0, -1, 0)
+            self._free_and_send_watermark(alloc_id, decode_req)
             decode_req._scatter_event = None
             decode_req._scatter_alloc_id = -1
             decode_req._staging_scatter_done = True
@@ -312,7 +617,7 @@ class DecodeStagingHandler:
         device = k_buffers[0].device
         torch.cuda.set_device(device)
 
-        if not hasattr(self.staging_allocator, "_scatter_stream"):
+        if self.staging_allocator._scatter_stream is None:
             self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
 
         scatter_stream = self.staging_allocator._scatter_stream
@@ -372,24 +677,10 @@ class DecodeStagingHandler:
     def _free_and_send_watermark(
         self, alloc_id: int, decode_req: DecodeRequest
     ) -> None:
-        """Free a staging allocation and broadcast watermark to all prefills."""
+        """Free a staging allocation and asynchronously broadcast its watermark."""
         self.staging_allocator.free(alloc_id)
-        post_wm = self.staging_allocator.get_watermark()
-        room = decode_req.req.bootstrap_room
-        wm_round, wm_tail = post_wm
-        wm_round_b = str(wm_round).encode("ascii")
-        wm_tail_b = str(wm_tail).encode("ascii")
-        for _key, (receiver, session_id) in list(self._wm_subscribers.items()):
-            sid_b = session_id.encode("ascii")
-            for bootstrap_info in receiver.bootstrap_infos:
-                try:
-                    sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
-                    with lock:
-                        sock.send_multipart(
-                            [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
-                        )
-                except Exception:
-                    pass
+        wm_round, wm_tail = self.staging_allocator.get_watermark()
+        self._queue_watermark_broadcast(wm_round, wm_tail)
 
 
 def is_watermark_ready(
