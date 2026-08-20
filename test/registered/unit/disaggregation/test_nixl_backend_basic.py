@@ -1,5 +1,6 @@
 """Basic CPU unit tests for NIXL disaggregation control paths."""
 
+import signal
 import struct
 import sys
 import threading
@@ -13,7 +14,10 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
+    PrefillStagingContext,
+)
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
@@ -709,6 +713,40 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
+    def test_cancel_pending_xfers_returns_only_handles_that_remain_active(self):
+        agent = MagicMock()
+        agent.check_xfer_state.side_effect = lambda handle: {
+            "done": "DONE",
+            "cancelled": "PROC",
+            "active": "PROC",
+        }[handle]
+
+        def release(handle):
+            if handle == "active":
+                raise RuntimeError("backend cannot cancel")
+
+        agent.release_xfer_handle.side_effect = release
+        mgr = self._make_manager(agent)
+
+        uncancelled = mgr._cancel_pending_xfers(
+            ["done", "cancelled", "active"], room=17
+        )
+
+        self.assertEqual(uncancelled, ["active"])
+        self.assertEqual(
+            agent.release_xfer_handle.call_args_list,
+            [unittest.mock.call("cancelled"), unittest.mock.call("active")],
+        )
+
+    def test_uncancelled_xfer_requests_process_tree_shutdown(self):
+        with (
+            patch("sglang.srt.disaggregation.nixl.conn.os.getppid", return_value=321),
+            patch("sglang.srt.disaggregation.nixl.conn.os.kill") as kill,
+        ):
+            NixlKVManager._request_fatal_transfer_shutdown(17, 2)
+
+        kill.assert_called_once_with(321, signal.SIGQUIT)
+
     def test_register_buffer_to_engine_groups_kv_memory_kinds_in_one_pass(self):
         agent = StagingFakeAgent(register_result=["desc"])
         mgr = self._make_manager(agent)
@@ -992,6 +1030,63 @@ class TestNixlStaging(CustomTestCase):
             )
 
         self.assertIsNone(handle)
+
+
+class TestDecodeStagingStallGuard(CustomTestCase):
+    @staticmethod
+    def _make_handler_and_request():
+        handler = object.__new__(DecodeStagingHandler)
+        receiver = SimpleNamespace(chunk_staging_infos=[(41, 0, 1, 0, 1)])
+        handler._room_to_receiver = {17: receiver}
+        handler.staging_allocator = MagicMock()
+        handler.staging_allocator.get_watermark.return_value = (3, 8)
+        handler.kv_manager = MagicMock()
+        handler._free_and_send_watermark = MagicMock()
+
+        event = MagicMock()
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(bootstrap_room=17),
+            _chunk_events=[],
+            _scatter_event=event,
+            _scatter_alloc_id=41,
+            _staging_last_scatter_submitted=True,
+            _staging_scatter_done=False,
+            _staging_progress_lock=threading.Lock(),
+            _staging_stall_since=0.0,
+            _staging_stall_failed=False,
+        )
+        return handler, receiver, decode_req, event
+
+    def test_completed_last_scatter_is_consumed_before_stall_check(self):
+        handler, receiver, decode_req, event = self._make_handler_and_request()
+        event.query.return_value = True
+
+        with patch(
+            "sglang.srt.disaggregation.common.staging_handler.time.monotonic",
+            return_value=1000.0,
+        ):
+            handler.advance_scatter(decode_req)
+
+        self.assertFalse(decode_req._staging_stall_failed)
+        self.assertTrue(decode_req._staging_scatter_done)
+        self.assertIsNone(decode_req._scatter_event)
+        self.assertEqual(receiver.chunk_staging_infos[-1], (-1, -1, 0, -1, 0))
+        handler._free_and_send_watermark.assert_called_once_with(41, decode_req)
+        handler.kv_manager.record_failure.assert_not_called()
+
+    def test_late_progress_cannot_revive_a_failed_room(self):
+        handler, _receiver, decode_req, event = self._make_handler_and_request()
+        event.query.return_value = False
+
+        with patch(
+            "sglang.srt.disaggregation.common.staging_handler.time.monotonic",
+            return_value=1000.0,
+        ):
+            handler._check_room_stall(17, decode_req)
+
+        self.assertTrue(decode_req._staging_stall_failed)
+        handler._note_staging_progress(decode_req)
+        self.assertEqual(decode_req._staging_stall_since, 0.0)
 
 
 if __name__ == "__main__":

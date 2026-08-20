@@ -4,6 +4,7 @@ import dataclasses
 import json
 import logging
 import os
+import signal
 import struct
 import threading
 import time
@@ -575,9 +576,7 @@ class NixlKVManager(CommonKVManager):
                     for key in self.connection_pool
                     if key.startswith(failed_bootstrap_addr)
                 ]
-            subscriber_tokens = handler.snapshot_wm_subscribers(
-                bootstrap_info_groups
-            )
+            subscriber_tokens = handler.snapshot_wm_subscribers(bootstrap_info_groups)
 
         super()._handle_node_failure(failed_bootstrap_addr)
 
@@ -1284,18 +1283,20 @@ class NixlKVManager(CommonKVManager):
                         next_handle_log_s += 10.0
                     if elapsed_s > STAGING_HANDLE_WAIT_TIMEOUT_S:
                         # Cancel our writes before the decode-side stall guard
-                        # (60s) frees the target allocations for reuse; then
-                        # fail just this room via the worker's except path.
-                        for handle in handles:
-                            try:
-                                if self.agent.check_xfer_state(handle) != "DONE":
-                                    self.agent.release_xfer_handle(handle)
-                            except Exception:
-                                logger.exception(
-                                    "[STAGING_HANDLE_TIMEOUT] cancel failed "
-                                    "room=%s",
-                                    room,
-                                )
+                        # (60s) frees the target allocations for reuse. A
+                        # successful cancel can fail just this room; a failed
+                        # cancel must escalate because slot reuse is unsafe.
+                        uncancelled = self._cancel_pending_xfers(handles, room)
+                        if uncancelled:
+                            # Request-level cleanup is unsafe in this state:
+                            # decode may free/reuse the staging slot while the
+                            # NIC still owns an active WRITE. Escalate to the
+                            # existing process-tree shutdown path instead of
+                            # allowing a late RDMA write to corrupt another
+                            # request's KV cache.
+                            self._request_fatal_transfer_shutdown(
+                                room, len(uncancelled)
+                            )
                         raise RuntimeError(
                             f"[STAGING_HANDLE_TIMEOUT] room={room} NIXL "
                             f"transfer not DONE after {elapsed_s:.0f}s "
@@ -1330,6 +1331,31 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+
+    def _cancel_pending_xfers(self, handles: List[Any], room: int) -> List[Any]:
+        """Cancel active NIXL handles and return those still unsafe to reuse."""
+        uncancelled = []
+        for handle in handles:
+            try:
+                if self.agent.check_xfer_state(handle) == "DONE":
+                    continue
+                self.agent.release_xfer_handle(handle)
+            except Exception:
+                uncancelled.append(handle)
+                logger.exception("[STAGING_HANDLE_TIMEOUT] cancel failed room=%s", room)
+        return uncancelled
+
+    @staticmethod
+    def _request_fatal_transfer_shutdown(room: int, pending_count: int) -> None:
+        """Use SGLang's process-tree shutdown when active RDMA cannot cancel."""
+        logger.critical(
+            "[STAGING_HANDLE_TIMEOUT] room=%s has %s active NIXL transfer(s) "
+            "that could not be cancelled; requesting process-tree shutdown "
+            "before decode can reuse their staging slots.",
+            room,
+            pending_count,
+        )
+        os.kill(os.getppid(), signal.SIGQUIT)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1851,9 +1877,7 @@ class NixlKVManager(CommonKVManager):
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
             now = time.monotonic()
-            remote_wm = self._staging_ctx.remote_watermarks.get(
-                req.agent_name, (0, 0)
-            )
+            remote_wm = self._staging_ctx.remote_watermarks.get(req.agent_name, (0, 0))
             # An advancing watermark means backlog (decode is draining, we
             # just have not caught up yet), not a stall: restart the clock so
             # only a FROZEN watermark can accumulate toward the timeout.
