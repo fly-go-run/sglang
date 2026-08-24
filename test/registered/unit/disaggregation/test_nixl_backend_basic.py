@@ -738,16 +738,19 @@ class TestNixlStaging(CustomTestCase):
 
     def test_cancel_pending_xfers_returns_only_handles_that_remain_active(self):
         agent = MagicMock()
-        agent.check_xfer_state.side_effect = lambda handle: {
-            "done": "DONE",
-            "cancelled": "PROC",
-            "active": "PROC",
-        }[handle]
+        released = set()
+
+        def check_state(handle):
+            if handle == "done" or handle in released:
+                return "DONE"
+            return "PROC"
 
         def release(handle):
             if handle == "active":
                 raise RuntimeError("backend cannot cancel")
+            released.add(handle)
 
+        agent.check_xfer_state.side_effect = check_state
         agent.release_xfer_handle.side_effect = release
         mgr = self._make_manager(agent)
 
@@ -763,7 +766,7 @@ class TestNixlStaging(CustomTestCase):
 
     def test_timed_out_xfer_with_successful_cancel_does_not_fail_stop(self):
         agent = MagicMock()
-        agent.check_xfer_state.return_value = "PROC"
+        agent.check_xfer_state.side_effect = ["PROC", "PROC", "DONE"]
         mgr = self._make_manager(agent)
         mgr._request_fatal_transfer_shutdown = MagicMock()
 
@@ -783,17 +786,60 @@ class TestNixlStaging(CustomTestCase):
         agent.release_xfer_handle.assert_called_once_with("handle")
         mgr._request_fatal_transfer_shutdown.assert_not_called()
 
-    def test_err_xfer_still_requests_process_tree_shutdown(self):
+    def test_peer_gone_fails_room_without_process_tree_shutdown(self):
+        for error_code in ("NIXL_ERR_REMOTE_DISCONNECT", "NIXL_ERR_NOT_FOUND"):
+            with self.subTest(error_code=error_code):
+                agent = MagicMock()
+                agent.check_xfer_state.side_effect = RuntimeError(
+                    f"transport failed: {error_code}"
+                )
+                mgr = self._make_manager(agent)
+                mgr._request_fatal_transfer_shutdown = MagicMock()
+                mgr._staging_ctx.send_ops[(17, 3, "decode")] = {
+                    "state": "POSTED",
+                    "handle": "handle",
+                }
+
+                with self.assertRaisesRegex(
+                    StagingTransferCancelledError, "STAGING_PEER_GONE"
+                ):
+                    mgr._wait_for_xfers(["handle"], 17, 0, False)
+                mgr._mark_staging_send_failed(17, 3, "decode")
+
+                mgr._request_fatal_transfer_shutdown.assert_not_called()
+                agent.release_xfer_handle.assert_not_called()
+                self.assertEqual(
+                    mgr._staging_ctx.send_ops[(17, 3, "decode")]["state"],
+                    "FAILED",
+                )
+
+    def test_unknown_xfer_error_still_requests_process_tree_shutdown(self):
         agent = MagicMock()
-        agent.check_xfer_state.return_value = "ERR"
+        agent.check_xfer_state.side_effect = RuntimeError("unclassified failure")
         mgr = self._make_manager(agent)
         mgr._request_fatal_transfer_shutdown = MagicMock()
 
-        with self.assertRaisesRegex(RuntimeError, "encountered ERR"):
+        with self.assertRaisesRegex(RuntimeError, "unclassified failure"):
             mgr._wait_for_xfers(["handle"], 17, 0, False)
 
         mgr._request_fatal_transfer_shutdown.assert_called_once_with(
-            17, 1, reason="staging-transfer-err"
+            17, 1, reason="staging-transfer-state-unknown"
+        )
+
+    def test_multi_handle_remote_disconnect_uses_worst_attribution(self):
+        agent = MagicMock()
+        agent.check_xfer_state.side_effect = [
+            RuntimeError("NIXL_ERR_REMOTE_DISCONNECT"),
+            RuntimeError("unclassified second-handle failure"),
+        ]
+        mgr = self._make_manager(agent)
+        mgr._request_fatal_transfer_shutdown = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "other transfers remain unsafe"):
+            mgr._wait_for_xfers(["peer-gone", "unknown"], 17, 0, False)
+
+        mgr._request_fatal_transfer_shutdown.assert_called_once_with(
+            17, 1, reason="staging-transfer-state-unknown"
         )
 
     def test_cancelled_staging_send_is_marked_failed(self):

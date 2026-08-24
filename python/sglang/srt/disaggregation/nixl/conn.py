@@ -79,8 +79,10 @@ try:
         nixlBackendError,
         nixlCancelledError,
     )
+    _NIXL_REMOTE_GONE_ERRORS = (nixlRemoteDisconnectError,)
 except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
+    _NIXL_REMOTE_GONE_ERRORS = ()
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +95,18 @@ class StagingPostAmbiguousError(RuntimeError):
 
 
 class StagingTransferCancelledError(RuntimeError):
-    """A timed-out transfer was cancelled and its source is safe to reuse."""
+    """A transfer was quiesced and its source is safe to reuse."""
+
+
+def _is_nixl_remote_gone_error(exc: BaseException) -> bool:
+    """Return whether NIXL says the peer agent/endpoint no longer exists."""
+    if isinstance(exc, _NIXL_REMOTE_GONE_ERRORS):
+        return True
+    error_text = f"{type(exc).__name__}: {exc}".upper()
+    return any(
+        code in error_text
+        for code in ("NIXL_ERR_REMOTE_DISCONNECT", "NIXL_ERR_NOT_FOUND")
+    )
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
@@ -1351,16 +1364,46 @@ class NixlKVManager(CommonKVManager):
             for handle in handles:
                 try:
                     state = self.agent.check_xfer_state(handle)
-                except Exception:
+                except Exception as exc:
+                    if _is_nixl_remote_gone_error(exc):
+                        unsafe = self._cancel_pending_xfers(
+                            [other for other in handles if other is not handle], room
+                        )
+                        if unsafe:
+                            self._request_fatal_transfer_shutdown(
+                                room,
+                                len(unsafe),
+                                reason="staging-transfer-state-unknown",
+                            )
+                            raise RuntimeError(
+                                f"NIXL peer disappeared for room={room}, but "
+                                f"{len(unsafe)} other transfers remain unsafe"
+                            ) from exc
+                        raise StagingTransferCancelledError(
+                            f"[STAGING_PEER_GONE] room={room} peer agent "
+                            f"disappeared; failed the request after all "
+                            f"{len(handles)} transfers became safe"
+                        ) from exc
                     self._request_fatal_transfer_shutdown(
                         room, 1, reason="staging-transfer-state-unknown"
                     )
                     raise
                 if state == "ERR":
-                    self._request_fatal_transfer_shutdown(
-                        room, 1, reason="staging-transfer-err"
+                    unsafe = self._cancel_pending_xfers(handles, room)
+                    if unsafe:
+                        self._request_fatal_transfer_shutdown(
+                            room,
+                            len(unsafe),
+                            reason="staging-transfer-state-unknown",
+                        )
+                        raise RuntimeError(
+                            f"NIXL transfer entered ERR for room={room}, but "
+                            f"{len(unsafe)} transfers remain unsafe"
+                        )
+                    raise StagingTransferCancelledError(
+                        f"[STAGING_HANDLE_ERR] room={room} transfer failed; "
+                        "cancelled remaining transfers and failed the request"
                     )
-                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
                 if state != "DONE":
                     pending_count += 1
             if pending_count == 0:
@@ -1396,16 +1439,67 @@ class NixlKVManager(CommonKVManager):
             time.sleep(0)
 
     def _cancel_pending_xfers(self, handles: List[Any], room: int) -> List[Any]:
-        """Cancel active NIXL handles and return those still unsafe to reuse."""
+        """Cancel active NIXL handles and return those still unsafe to reuse.
+
+        Treating a vanished peer as quiesced depends on the deployed NIXL UCX
+        backend setting ``ucx_error_handling_mode=peer``: once the endpoint is
+        disconnected, the NIC will not continue reading the source buffer.
+        """
         uncancelled = []
         for handle in handles:
             try:
                 if self.agent.check_xfer_state(handle) == "DONE":
                     continue
-                self.agent.release_xfer_handle(handle)
-            except Exception:
+            except Exception as exc:
+                if _is_nixl_remote_gone_error(exc):
+                    logger.warning(
+                        "[STAGING_HANDLE_PEER_GONE] room=%s handle=%s; "
+                        "source buffer is safe to reuse",
+                        room,
+                        handle,
+                    )
+                    continue
                 uncancelled.append(handle)
-                logger.exception("[STAGING_HANDLE_TIMEOUT] cancel failed room=%s", room)
+                logger.exception(
+                    "[STAGING_HANDLE_CANCEL] state query failed room=%s", room
+                )
+                continue
+
+            try:
+                self.agent.release_xfer_handle(handle)
+            except Exception as exc:
+                if _is_nixl_remote_gone_error(exc):
+                    logger.warning(
+                        "[STAGING_HANDLE_PEER_GONE] room=%s handle=%s "
+                        "disappeared during cancel; source buffer is safe to reuse",
+                        room,
+                        handle,
+                    )
+                    continue
+                uncancelled.append(handle)
+                logger.exception("[STAGING_HANDLE_CANCEL] cancel failed room=%s", room)
+                continue
+
+            try:
+                state = self.agent.check_xfer_state(handle)
+            except Exception as exc:
+                if _is_nixl_remote_gone_error(exc):
+                    continue
+                uncancelled.append(handle)
+                logger.exception(
+                    "[STAGING_HANDLE_CANCEL] post-cancel state query failed " "room=%s",
+                    room,
+                )
+                continue
+            if state not in ("DONE", "ERR"):
+                uncancelled.append(handle)
+                logger.error(
+                    "[STAGING_HANDLE_CANCEL] room=%s handle=%s remains in "
+                    "unrecognized state=%s after cancel",
+                    room,
+                    handle,
+                    state,
+                )
         return uncancelled
 
     @staticmethod
