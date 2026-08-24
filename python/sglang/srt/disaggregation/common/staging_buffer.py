@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import defaultdict
 from typing import List, Optional, Tuple
 
 import torch
@@ -26,6 +27,23 @@ logger = logging.getLogger(__name__)
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
 _USE_TRITON_STAGING = not bool(os.environ.get("SGLANG_STAGING_USE_TORCH", ""))
+
+
+class StagingInvariantCounters:
+    """Small thread-safe counter set for staging safety invariants."""
+
+    def __init__(self):
+        self._counts = defaultdict(int)
+        self._lock = threading.Lock()
+
+    def increment(self, name: str) -> int:
+        with self._lock:
+            self._counts[name] += 1
+            return self._counts[name]
+
+    def get(self, name: str) -> int:
+        with self._lock:
+            return self._counts[name]
 
 
 @triton.jit
@@ -190,6 +208,12 @@ class StagingAllocator:
         self.round = 0
         self.allocations: dict = {}  # alloc_id -> (offset, size, round)
         self.alloc_order: List[int] = []
+        # A quarantined allocation pins its position in allocations/alloc_order
+        # until this process exits. It is never returned to the ring.
+        self.quarantined_allocations: set[int] = set()
+        self.quarantine_count = 0
+        self.invariant_counters = StagingInvariantCounters()
+        self._quarantine_callback = None
         self.next_alloc_id = 0
         self.watermark_round = 0
         self.watermark_tail = 0
@@ -225,11 +249,43 @@ class StagingAllocator:
             self.alloc_order.append(alloc_id)
             return (alloc_id, offset, self.round)
 
-    def free(self, alloc_id: int):
+    def set_quarantine_callback(self, callback) -> None:
+        self._quarantine_callback = callback
+
+    def quarantine(self, alloc_id: int, reason: str = "") -> bool:
+        """Permanently pin an allocation. Returns True on the first quarantine."""
+        first_quarantine = False
+        with self.lock:
+            if alloc_id not in self.allocations:
+                return False
+            if alloc_id not in self.quarantined_allocations:
+                self.quarantined_allocations.add(alloc_id)
+                self.quarantine_count += 1
+                first_quarantine = self.quarantine_count == 1
+        logger.error(
+            "[STAGING_QUARANTINE] alloc_id=%s reason=%s quarantine_count=%s",
+            alloc_id,
+            reason,
+            self.quarantine_count,
+        )
+        if first_quarantine and self._quarantine_callback is not None:
+            self._quarantine_callback(alloc_id, reason)
+        return True
+
+    def free(self, alloc_id: int) -> bool:
         """Free an allocation and advance watermark past consecutive freed entries."""
         with self.lock:
             if alloc_id not in self.allocations:
-                return
+                return False
+            if alloc_id in self.quarantined_allocations:
+                count = self.invariant_counters.increment("free_quarantined")
+                logger.error(
+                    "[STAGING_INVARIANT] free_quarantined=%s alloc_id=%s; "
+                    "ignoring free to keep the ring watermark pinned",
+                    count,
+                    alloc_id,
+                )
+                return False
             self.allocations.pop(alloc_id)
 
             while self.alloc_order and self.alloc_order[0] not in self.allocations:
@@ -242,6 +298,7 @@ class StagingAllocator:
                 off, _, rnd = self.allocations[self.alloc_order[0]]
                 self.watermark_round = rnd
                 self.watermark_tail = off
+            return True
 
     def get_watermark(self) -> Tuple[int, int]:
         """Return (round, tail_offset). Everything before this is safe to write."""
