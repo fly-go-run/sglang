@@ -14,11 +14,11 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.staging_buffer import StagingInvariantCounters
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
     PrefillStagingContext,
 )
-from sglang.srt.disaggregation.common.staging_buffer import StagingInvariantCounters
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,

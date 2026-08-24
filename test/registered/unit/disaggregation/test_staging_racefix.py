@@ -113,6 +113,7 @@ class TestStagingRaceFix(CustomTestCase):
     def test_writer_slot_dedup_and_scatter_once_claim(self):
         handler = object.__new__(DecodeStagingHandler)
         handler.decode_tp = 1
+        handler.kv_manager = SimpleNamespace()
         handler.tp_rank = 0
         handler.invariant_counters = StagingInvariantCounters()
         handler.staging_allocator = SimpleNamespace(_scatter_stream=object())
@@ -155,6 +156,10 @@ class TestStagingRaceFix(CustomTestCase):
         ):
             self.assertTrue(handler.submit_chunk_scatter(9, 0, 0, 4))
             self.assertTrue(handler.submit_chunk_scatter(9, 0, 0, 4))
+        self.assertEqual(
+            handler.handle_chunk_arrived(9, 0, 0, 4, 0, "peer-a", counts),
+            (False, False),
+        )
 
         handler._scatter_region.assert_called_once()
         self.assertEqual(lifecycle.chunk_states[0], "SCATTER_SUBMITTED")
@@ -162,6 +167,7 @@ class TestStagingRaceFix(CustomTestCase):
     def test_legacy_shared_arrival_api_still_submits_scatter(self):
         handler = object.__new__(DecodeStagingHandler)
         handler.decode_tp = 1
+        handler.kv_manager = SimpleNamespace()
         receiver = SimpleNamespace(
             prefill_info=SimpleNamespace(attn_tp_size=1),
             chunk_staging_infos=[(3, 64, 0, 128, 2)],
@@ -187,6 +193,11 @@ class TestStagingRaceFix(CustomTestCase):
             (True, True),
         )
         handler.submit_chunk_scatter.assert_called_once_with(4, 0, 0, 2)
+        handler.submit_chunk_scatter.reset_mock()
+        self.assertTrue(handler.submit_last_scatter_async(4))
+        handler.submit_chunk_scatter.assert_called_once_with(
+            4, 0, 0, 2, is_last_chunk=True
+        )
 
     def test_late_staging_req_after_scatter_is_rejected(self):
         allocator = _cpu_allocator()
