@@ -168,6 +168,7 @@ class TestStagingRaceFix(CustomTestCase):
         handler = object.__new__(DecodeStagingHandler)
         handler.decode_tp = 1
         handler.kv_manager = SimpleNamespace()
+        handler._requires_last_writer_slots = False
         receiver = SimpleNamespace(
             prefill_info=SimpleNamespace(attn_tp_size=1),
             chunk_staging_infos=[(3, 64, 0, 128, 2)],

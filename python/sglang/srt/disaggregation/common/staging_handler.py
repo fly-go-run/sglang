@@ -66,6 +66,7 @@ class DecodeStagingContext:
     allocator: object = None
     room_bootstrap: dict = dataclasses.field(default_factory=dict)
     room_receivers: dict = dataclasses.field(default_factory=dict)
+    requires_last_writer_slots: bool = False
 
 
 @dataclasses.dataclass
@@ -127,6 +128,7 @@ class DecodeStagingHandler:
         tp_rank: int,
         scheduler,
         fatal_shutdown=None,
+        requires_last_writer_slots: bool = False,
     ):
         self.kv_manager = kv_manager
         self.staging_allocator = staging_allocator
@@ -136,6 +138,7 @@ class DecodeStagingHandler:
         self.tp_rank = tp_rank
         self.scheduler = scheduler
         self._fatal_shutdown = fatal_shutdown
+        self._requires_last_writer_slots = requires_last_writer_slots
         self._room_to_decode_req: dict = {}
         # Failure paths clear decode_req.kv_receiver before unregistering the
         # room, so retain the receiver needed to release staging allocations.
@@ -417,6 +420,9 @@ class DecodeStagingHandler:
             scheduler=scheduler,
             fatal_shutdown=getattr(
                 kv_manager, "_request_fatal_transfer_shutdown", None
+            ),
+            requires_last_writer_slots=(
+                kv_manager._staging_ctx.requires_last_writer_slots
             ),
         )
 
@@ -872,11 +878,8 @@ class DecodeStagingHandler:
             chunk_idx = max(lifecycle.chunk_geometry)
             page_start, num_pages = lifecycle.chunk_geometry[chunk_idx]
             decode_req = self._room_to_decode_req.get(room)
-            requires_writer_slots = getattr(
-                self.kv_manager, "_staging_requires_last_writer_slots", False
-            )
             if decode_req is None or (
-                requires_writer_slots
+                self._requires_last_writer_slots
                 and len(lifecycle.seen_writer_slots.get(chunk_idx, set()))
                 < self.num_writers_for(decode_req)
             ):

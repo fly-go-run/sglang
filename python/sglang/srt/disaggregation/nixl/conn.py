@@ -450,6 +450,9 @@ class NixlKVManager(CommonKVManager):
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
+        self._staging_ctx = None
+        self._staging_handler = None
+        self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(set))
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
             None  # (handle, num_groups, num_ptr_pairs, num_slots)
@@ -492,9 +495,6 @@ class NixlKVManager(CommonKVManager):
             )
             if self.enable_staging:
                 self._init_staging_decode_ctx()
-                self._staging_handler = None
-                self._staging_requires_last_writer_slots = True
-                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(set))
                 self._start_decode_staging_thread()
             self._start_heartbeat_checker_thread()
         else:
@@ -519,6 +519,7 @@ class NixlKVManager(CommonKVManager):
         )
 
         self._staging_ctx = DecodeStagingContext()
+        self._staging_ctx.requires_last_writer_slots = True
         self._init_staging_allocator()
 
     def _init_staging_buffers(self, count: int):
@@ -577,7 +578,7 @@ class NixlKVManager(CommonKVManager):
         same endpoints concurrently, its newer generation survives cleanup.
         """
         subscriber_tokens = []
-        handler = getattr(self, "_staging_handler", None)
+        handler = self._staging_handler
         if self.enable_staging and handler is not None:
             with self.connection_lock:
                 bootstrap_info_groups = [

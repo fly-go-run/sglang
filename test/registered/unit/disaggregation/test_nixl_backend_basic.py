@@ -667,6 +667,8 @@ class TestNixlNodeFailure(CustomTestCase):
         }
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
+        mgr.enable_staging = False
+        mgr._staging_handler = None
         mgr.update_status = CommonKVManager.update_status.__get__(mgr, CommonKVManager)
         mgr.check_status = CommonKVManager.check_status.__get__(mgr, CommonKVManager)
         mgr.record_failure = CommonKVManager.record_failure.__get__(
@@ -1043,26 +1045,33 @@ class TestNixlStaging(CustomTestCase):
 class TestDecodeStagingStallGuard(CustomTestCase):
     @staticmethod
     def _make_handler_and_request():
-        handler = object.__new__(DecodeStagingHandler)
         receiver = SimpleNamespace(chunk_staging_infos=[(41, 0, 1, 0, 1)])
-        handler._room_to_receiver = {17: receiver}
-        handler.staging_allocator = MagicMock()
-        handler.staging_allocator.get_watermark.return_value = (3, 8)
-        handler.kv_manager = MagicMock()
-        handler._free_and_send_watermark = MagicMock()
-
         event = MagicMock()
         decode_req = SimpleNamespace(
             req=SimpleNamespace(bootstrap_room=17),
-            _chunk_events=[],
-            _scatter_event=event,
-            _scatter_alloc_id=41,
-            _staging_last_scatter_submitted=True,
-            _staging_scatter_done=False,
-            _staging_progress_lock=threading.Lock(),
-            _staging_stall_since=0.0,
-            _staging_stall_failed=False,
+            kv_receiver=receiver,
         )
+        allocator = MagicMock()
+        allocator.invariant_counters = StagingInvariantCounters()
+        allocator.get_watermark.return_value = (3, 8)
+        with patch("sglang.srt.disaggregation.common.staging_handler.threading.Thread"):
+            handler = DecodeStagingHandler(
+                kv_manager=MagicMock(),
+                staging_allocator=allocator,
+                kv_buffer_info={},
+                decode_tp=1,
+                total_kv_heads=1,
+                tp_rank=0,
+                scheduler=MagicMock(),
+            )
+        handler.register_decode_req(17, decode_req)
+        decode_req._scatter_event = event
+        decode_req._scatter_alloc_id = 41
+        decode_req._scatter_chunk_idx = 0
+        decode_req._staging_last_scatter_submitted = True
+        decode_req._staging_stall_since = 0.0
+        handler._room_lifecycles[17].chunk_states[0] = "SCATTER_SUBMITTED"
+        handler._free_and_send_watermark = MagicMock()
         return handler, receiver, decode_req, event
 
     def test_completed_last_scatter_is_consumed_before_stall_check(self):
