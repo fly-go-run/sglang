@@ -1907,6 +1907,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                if self.enable_staging and self.staging_handler.is_staging_room(
+                    decode_req.req.bootstrap_room
+                ):
+                    self.staging_handler.fence_failed_room(
+                        decode_req.req.bootstrap_room,
+                        "decode-transfer-failed",
+                    )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()

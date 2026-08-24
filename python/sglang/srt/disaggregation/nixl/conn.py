@@ -493,7 +493,7 @@ class NixlKVManager(CommonKVManager):
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
-                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
+                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(set))
                 self._start_decode_staging_thread()
             self._start_heartbeat_checker_thread()
         else:
@@ -647,6 +647,12 @@ class NixlKVManager(CommonKVManager):
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
+            handler,
+            max(
+                1,
+                (self.server_args.chunked_prefill_size or 8192)
+                // self.kv_args.page_size,
+            ),
         )
 
         receiver = self._staging_ctx.room_receivers.get(room)
@@ -2496,7 +2502,7 @@ class NixlKVManager(CommonKVManager):
                     else:
                         self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
                 elif tag == "stg":
-                    self._handle_stg_notification(components, room)
+                    self._handle_stg_notification(components, room, peer_name)
                 elif tag == "aux":
                     # main's "nokv" marker (decode-side radix cache hit):
                     # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
@@ -2505,7 +2511,7 @@ class NixlKVManager(CommonKVManager):
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
 
-    def _handle_stg_notification(self, components, room: int):
+    def _handle_stg_notification(self, components, room: int, peer_name: str = ""):
         """Handle a staging RDMA notification tag.
 
         Format: {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}_{page_start}_{num_pages}_{agent_name}
@@ -2516,11 +2522,27 @@ class NixlKVManager(CommonKVManager):
         chunk_idx = int(components[5])
         page_start = int(components[6])
         num_pages = int(components[7])
-        agent_name = components[8] if len(components) > 8 else ""
-        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
-        self._handle_staging_chunk_arrived(
-            room, chunk_idx, page_start, num_pages, agent_name
+        accepted, writers_ready = self._handle_staging_chunk_arrived(
+            room,
+            chunk_idx,
+            page_start,
+            num_pages,
+            pp_rank,
+            peer_name,
         )
+        if not accepted:
+            return
+        # Completion accounting is intentionally after geometry/writer
+        # validation and persistent deduplication.
+        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
+        if writers_ready and self._staging_handler is not None:
+            self._staging_handler.submit_chunk_scatter(
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                is_last_chunk=is_last_chunk,
+            )
 
     def _handle_aux_notification(self, room: int, components: List[str]):
         """Handle an aux notification and trigger last scatter if staging is complete.
@@ -2610,18 +2632,20 @@ class NixlKVManager(CommonKVManager):
         chunk_idx: int,
         page_start: int,
         num_pages: int,
-        agent_name: str,
+        engine_rank: int,
+        peer_name: str,
     ):
         """Process a staging chunk arrival via RDMA notification."""
         handler = self._staging_handler
         if handler is None:
-            return
-        handler.handle_chunk_arrived(
+            return (False, False)
+        return handler.handle_chunk_arrived(
             room,
             chunk_idx,
             page_start,
             num_pages,
-            agent_name,
+            engine_rank,
+            peer_name,
             self._chunk_writer_counts,
         )
 
