@@ -493,6 +493,7 @@ class NixlKVManager(CommonKVManager):
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
+                self._staging_requires_last_writer_slots = True
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(set))
                 self._start_decode_staging_thread()
             self._start_heartbeat_checker_thread()

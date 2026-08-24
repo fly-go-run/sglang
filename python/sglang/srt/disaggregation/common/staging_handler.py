@@ -751,10 +751,7 @@ class DecodeStagingHandler:
                 return (False, False)
             state = lifecycle.chunk_states.get(chunk_idx)
             expected_geometry = lifecycle.chunk_geometry.get(chunk_idx)
-            if state != "WRITABLE" or expected_geometry != (
-                page_start,
-                num_pages,
-            ):
+            if expected_geometry != (page_start, num_pages):
                 lifecycle.terminal = True
                 violation = (
                     f"[STAGING_GEOMETRY] notification mismatch room={room} "
@@ -790,16 +787,24 @@ class DecodeStagingHandler:
                             peer_name,
                         )
                         return (False, False)
-                    seen.add(writer_slot)
-                    writer_counts = chunk_writer_counts[room][chunk_idx]
-                    if hasattr(writer_counts, "add"):
-                        writer_counts.add(writer_slot)
+                    if state != "WRITABLE":
+                        lifecycle.terminal = True
+                        violation = (
+                            f"[STAGING_LIFECYCLE] new writer after scatter "
+                            f"room={room} chunk={chunk_idx} state={state} "
+                            f"writer_slot={writer_slot}"
+                        )
                     else:
-                        writer_counts.append(writer_slot)
-                    self._note_staging_progress(decode_req)
-                    writers_ready = len(seen) == num_writers
-                    if not legacy_submit:
-                        return (True, writers_ready)
+                        seen.add(writer_slot)
+                        writer_counts = chunk_writer_counts[room][chunk_idx]
+                        if hasattr(writer_counts, "add"):
+                            writer_counts.add(writer_slot)
+                        else:
+                            writer_counts.append(writer_slot)
+                        self._note_staging_progress(decode_req)
+                        writers_ready = len(seen) == num_writers
+                        if not legacy_submit:
+                            return (True, writers_ready)
         if violation is None and legacy_submit:
             if writers_ready:
                 self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
@@ -834,9 +839,14 @@ class DecodeStagingHandler:
             chunk_idx = max(lifecycle.chunk_geometry)
             page_start, num_pages = lifecycle.chunk_geometry[chunk_idx]
             decode_req = self._room_to_decode_req.get(room)
-            if decode_req is None or len(
-                lifecycle.seen_writer_slots.get(chunk_idx, set())
-            ) < self.num_writers_for(decode_req):
+            requires_writer_slots = getattr(
+                self.kv_manager, "_staging_requires_last_writer_slots", False
+            )
+            if decode_req is None or (
+                requires_writer_slots
+                and len(lifecycle.seen_writer_slots.get(chunk_idx, set()))
+                < self.num_writers_for(decode_req)
+            ):
                 return False
             state = lifecycle.chunk_states.get(chunk_idx)
             if state in ("SCATTER_SUBMITTED", "SCATTER_DONE"):
