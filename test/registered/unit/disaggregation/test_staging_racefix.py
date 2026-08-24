@@ -3,7 +3,7 @@
 import threading
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
 
@@ -51,6 +51,37 @@ class _FakeEvent:
 
 
 class TestStagingRaceFix(CustomTestCase):
+    @staticmethod
+    def _make_coverage_handler(expected_pages=899):
+        handler = object.__new__(DecodeStagingHandler)
+        handler.decode_tp = 1
+        handler.tp_rank = 0
+        handler._requires_last_writer_slots = True
+        handler.invariant_counters = StagingInvariantCounters()
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=object())
+        receiver = SimpleNamespace(
+            prefill_info=SimpleNamespace(attn_tp_size=1),
+            chunk_staging_infos=[(17, 256, 0, 512, expected_pages)],
+        )
+        decode_req = SimpleNamespace(
+            kv_receiver=receiver,
+            _staging_progress_lock=threading.Lock(),
+            _staging_stall_failed=False,
+            _staging_stall_since=None,
+            _chunk_events=[],
+        )
+        lifecycle = StagingRoomLifecycle(
+            chunk_states={0: "WRITABLE"},
+            chunk_geometry={0: (0, expected_pages)},
+        )
+        handler._room_to_decode_req = {19: decode_req}
+        handler._room_to_receiver = {19: receiver}
+        handler._room_lifecycles = {19: lifecycle}
+        handler._scatter_region = MagicMock(return_value=True)
+        handler.fail_staging_room = MagicMock()
+        counts = defaultdict(lambda: defaultdict(set))
+        return handler, lifecycle, counts
+
     def test_quarantined_allocation_never_frees_or_advances_watermark(self):
         allocator = _cpu_allocator()
         first = allocator.assign(64)[0]
@@ -65,6 +96,8 @@ class TestStagingRaceFix(CustomTestCase):
 
         self.assertIn(first, allocator.allocations)
         self.assertEqual(allocator.get_watermark(), watermark)
+        self.assertTrue(allocator.quarantine(first, "duplicate"))
+        self.assertEqual(allocator.quarantine_count, 1)
         self.assertEqual(allocator.invariant_counters.get("free_quarantined"), 1)
         callback.assert_called_once_with(first, "test")
 
@@ -78,6 +111,7 @@ class TestStagingRaceFix(CustomTestCase):
         strategy = SimpleNamespace(
             check_ready=MagicMock(return_value=(True, 0, 32, 0, 96)),
             staging_buffer=object(),
+            full_chunk_pages=2,
         )
         chunk = TransferKVChunk(
             room=7,
@@ -114,6 +148,7 @@ class TestStagingRaceFix(CustomTestCase):
         handler = object.__new__(DecodeStagingHandler)
         handler.decode_tp = 1
         handler.kv_manager = SimpleNamespace()
+        handler._requires_last_writer_slots = True
         handler.tp_rank = 0
         handler.invariant_counters = StagingInvariantCounters()
         handler.staging_allocator = SimpleNamespace(_scatter_stream=object())
@@ -163,6 +198,63 @@ class TestStagingRaceFix(CustomTestCase):
 
         handler._scatter_region.assert_called_once()
         self.assertEqual(lifecycle.chunk_states[0], "SCATTER_SUBMITTED")
+
+    def test_partial_intervals_cover_full_chunk_before_single_scatter(self):
+        handler, lifecycle, counts = self._make_coverage_handler()
+
+        self.assertEqual(
+            handler.handle_chunk_arrived(19, 0, 0, 567, 0, "peer", counts),
+            (True, False),
+        )
+        self.assertEqual(
+            handler.handle_chunk_arrived(19, 0, 567, 332, 0, "peer", counts),
+            (True, True),
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.staging_handler.torch.cuda.Event",
+            _FakeEvent,
+        ):
+            self.assertTrue(handler.submit_chunk_scatter(19, 0, 0, 899))
+            self.assertTrue(handler.submit_chunk_scatter(19, 0, 0, 899))
+
+        handler._scatter_region.assert_called_once_with(256, 0, 899, ANY)
+        self.assertEqual(lifecycle.chunk_states[0], "SCATTER_SUBMITTED")
+
+    def test_out_of_bounds_interval_fails_room(self):
+        handler, lifecycle, counts = self._make_coverage_handler()
+
+        self.assertEqual(
+            handler.handle_chunk_arrived(19, 0, 0, 900, 0, "peer", counts),
+            (False, False),
+        )
+
+        self.assertTrue(lifecycle.terminal)
+        handler.fail_staging_room.assert_called_once()
+        handler._scatter_region.assert_not_called()
+
+    def test_coverage_hole_does_not_scatter_and_completion_fails_room(self):
+        handler, lifecycle, counts = self._make_coverage_handler()
+
+        self.assertEqual(
+            handler.handle_chunk_arrived(19, 0, 0, 567, 0, "peer", counts),
+            (True, False),
+        )
+        self.assertEqual(
+            handler.handle_chunk_arrived(19, 0, 568, 331, 0, "peer", counts),
+            (True, False),
+        )
+        self.assertFalse(handler.submit_last_scatter_async(19))
+
+        self.assertTrue(lifecycle.terminal)
+        handler.fail_staging_room.assert_called_once()
+        handler._scatter_region.assert_not_called()
+
+    def test_terminal_last_scatter_does_not_dereference_cleared_receiver(self):
+        handler, lifecycle, _counts = self._make_coverage_handler()
+        lifecycle.terminal = True
+        handler._room_to_decode_req[19].kv_receiver = None
+
+        self.assertFalse(handler.submit_last_scatter_async(19))
 
     def test_legacy_shared_arrival_api_still_submits_scatter(self):
         handler = object.__new__(DecodeStagingHandler)

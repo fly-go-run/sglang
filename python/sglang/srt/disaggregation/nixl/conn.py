@@ -92,6 +92,10 @@ class StagingPostAmbiguousError(RuntimeError):
     """The transport may have accepted a post before raising."""
 
 
+class StagingTransferCancelledError(RuntimeError):
+    """A timed-out transfer was cancelled and its source is safe to reuse."""
+
+
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
     if kinds is None:
         return ["VRAM"] * expected_len
@@ -1201,11 +1205,9 @@ class NixlKVManager(CommonKVManager):
                                         worker_idx,
                                         kv_chunk.is_last_chunk,
                                     )
-                                except Exception:
-                                    self._request_fatal_transfer_shutdown(
-                                        room,
-                                        1,
-                                        reason="staging-source-not-terminal",
+                                except StagingTransferCancelledError:
+                                    self._mark_staging_send_failed(
+                                        room, kv_chunk.chunk_id, req.agent_name
                                     )
                                     raise
                                 kv_xfer_handle = None
@@ -1289,12 +1291,19 @@ class NixlKVManager(CommonKVManager):
                         )
                         req_handles.append(aux_xfer_handle)
 
-                    self._wait_for_xfers(
-                        req_handles,
-                        room,
-                        worker_idx,
-                        kv_chunk.is_last_chunk,
-                    )
+                    try:
+                        self._wait_for_xfers(
+                            req_handles,
+                            room,
+                            worker_idx,
+                            kv_chunk.is_last_chunk,
+                        )
+                    except StagingTransferCancelledError:
+                        if staging_handled:
+                            self._mark_staging_send_failed(
+                                room, kv_chunk.chunk_id, req.agent_name
+                            )
+                        raise
                     if staging_handled:
                         self._mark_staging_send_done(
                             room, kv_chunk.chunk_id, req.agent_name
@@ -1340,8 +1349,17 @@ class NixlKVManager(CommonKVManager):
         while handles:
             pending_count = 0
             for handle in handles:
-                state = self.agent.check_xfer_state(handle)
+                try:
+                    state = self.agent.check_xfer_state(handle)
+                except Exception:
+                    self._request_fatal_transfer_shutdown(
+                        room, 1, reason="staging-transfer-state-unknown"
+                    )
+                    raise
                 if state == "ERR":
+                    self._request_fatal_transfer_shutdown(
+                        room, 1, reason="staging-transfer-err"
+                    )
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
                 if state != "DONE":
                     pending_count += 1
@@ -1364,7 +1382,11 @@ class NixlKVManager(CommonKVManager):
                 uncancelled = self._cancel_pending_xfers(handles, room)
                 if uncancelled:
                     self._request_fatal_transfer_shutdown(room, len(uncancelled))
-                raise RuntimeError(
+                    raise RuntimeError(
+                        f"[STAGING_HANDLE_TIMEOUT] room={room} has "
+                        f"{len(uncancelled)} uncancelled transfers"
+                    )
+                raise StagingTransferCancelledError(
                     f"[STAGING_HANDLE_TIMEOUT] room={room} NIXL transfer not "
                     f"DONE after {elapsed_s:.0f}s "
                     f"(pending={pending_count}/{len(handles)}, "
@@ -1759,6 +1781,8 @@ class NixlKVManager(CommonKVManager):
         dst_kv_item_len: int,
         notif: str,
         staging_buffer=None,
+        staging_page_offset: int = 0,
+        staging_allocation_size: Optional[int] = None,
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -1803,16 +1827,61 @@ class NixlKVManager(CommonKVManager):
             num_layers,
         )
         writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
-        rank_offset = sum(writer_rank_bytes[:writer_idx])
+        if writer_rank_bytes[writer_idx] != per_rank_bytes:
+            raise RuntimeError(
+                "[STAGING_GEOMETRY] writer layout mismatch: "
+                f"computed={writer_rank_bytes[writer_idx]} actual={per_rank_bytes}"
+            )
+        num_pages = len(prefill_kv_indices)
+        if num_pages == 0:
+            return None
+        if staging_allocation_size is None:
+            staging_allocation_size = total_staging_needed
+        bytes_per_page = total_staging_needed // num_pages
+        if (
+            total_staging_needed % num_pages != 0
+            or staging_allocation_size % bytes_per_page != 0
+        ):
+            raise RuntimeError(
+                "[STAGING_GEOMETRY] allocation is not page aligned: "
+                f"fragment_bytes={total_staging_needed} "
+                f"allocation_bytes={staging_allocation_size} pages={num_pages}"
+            )
+        allocation_pages = staging_allocation_size // bytes_per_page
+        if (
+            staging_page_offset < 0
+            or staging_page_offset + num_pages > allocation_pages
+        ):
+            raise RuntimeError(
+                "[STAGING_GEOMETRY] source fragment outside allocation: "
+                f"offset={staging_page_offset} pages={num_pages} "
+                f"allocation_pages={allocation_pages}"
+            )
+        full_num_tokens = allocation_pages * page_size
+        _, full_writer_rank_bytes, full_staging_size = compute_staging_layout(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            dst_tp_rank,
+            total_kv_heads,
+            full_num_tokens,
+            head_dim * dtype_size,
+            num_layers,
+        )
+        if full_staging_size != staging_allocation_size:
+            raise RuntimeError(
+                "[STAGING_GEOMETRY] allocation layout mismatch: "
+                f"computed={full_staging_size} actual={staging_allocation_size}"
+            )
+        rank_offset = sum(full_writer_rank_bytes[:writer_idx])
 
         if not staging_buffer.fits(per_rank_bytes):
             logger.warning(
                 f"Prefill staging too small for {per_rank_bytes} bytes, falling back"
             )
             return None
-        if dst_staging_size < total_staging_needed:
+        if dst_staging_size < staging_allocation_size:
             logger.warning(
-                f"Decode staging too small: need {total_staging_needed} bytes, "
+                f"Decode staging too small: need {staging_allocation_size} bytes, "
                 f"have {dst_staging_size}, falling back"
             )
             return None
@@ -1834,13 +1903,42 @@ class NixlKVManager(CommonKVManager):
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset
-        src_reqs = np.array(
-            [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
-            dtype=np.int64,
-        )
-        dst_reqs = np.array(
-            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
-        )
+        if staging_page_offset == 0 and allocation_pages == num_pages:
+            src_reqs = np.array(
+                [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
+                dtype=np.int64,
+            )
+            dst_reqs = np.array(
+                [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
+            )
+        else:
+            bytes_per_token = num_heads_to_send * head_dim * dtype_size
+            full_per_layer_bytes = full_num_tokens * bytes_per_token
+            page_byte_offset = staging_page_offset * page_size * bytes_per_token
+            src_reqs = np.array(
+                [
+                    [
+                        staging_buffer.get_ptr() + layer_idx * per_layer_bytes,
+                        per_layer_bytes,
+                        self.kv_args.gpu_id,
+                    ]
+                    for layer_idx in range(num_layers * 2)
+                ],
+                dtype=np.int64,
+            )
+            dst_reqs = np.array(
+                [
+                    [
+                        dst_write_ptr
+                        + layer_idx * full_per_layer_bytes
+                        + page_byte_offset,
+                        per_layer_bytes,
+                        dst_gpu_id,
+                    ]
+                    for layer_idx in range(num_layers * 2)
+                ],
+                dtype=np.int64,
+            )
 
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
@@ -1920,6 +2018,10 @@ class NixlKVManager(CommonKVManager):
                     return (None, False, True)
                 if state == "POSTED":
                     return (operation["handle"], False, True)
+                if state == "FAILED":
+                    raise RuntimeError(
+                        f"[STAGING_SEND_FAILED] operation {op_key} cannot retry"
+                    )
                 if state == "POSTING":
                     count = self._staging_ctx.invariant_counters.increment(
                         "duplicate_post"
@@ -2039,6 +2141,10 @@ class NixlKVManager(CommonKVManager):
                 dst_info.dst_kv_item_len,
                 notif_tag,
                 staging_buffer=staging_strategy.staging_buffer,
+                staging_page_offset=(
+                    page_start - chunk_idx * staging_strategy.full_chunk_pages
+                ),
+                staging_allocation_size=c_end - c_offset,
             )
         except StagingPostAmbiguousError:
             self._request_fatal_transfer_shutdown(
@@ -2071,6 +2177,13 @@ class NixlKVManager(CommonKVManager):
             operation = self._staging_ctx.send_ops.get(op_key)
             if operation is not None and operation["state"] == "POSTED":
                 operation["state"] = "DONE"
+
+    def _mark_staging_send_failed(self, room: int, chunk_id: int, agent_name: str):
+        op_key = (room, chunk_id, agent_name)
+        with self._staging_ctx.send_ops_lock:
+            operation = self._staging_ctx.send_ops.get(op_key)
+            if operation is not None:
+                operation["state"] = "FAILED"
 
     def _is_staging_send_done(self, room: int, chunk_id: int, agent_name: str) -> bool:
         with self._staging_ctx.send_ops_lock:
@@ -2524,7 +2637,7 @@ class NixlKVManager(CommonKVManager):
         chunk_idx = int(components[5])
         page_start = int(components[6])
         num_pages = int(components[7])
-        accepted, writers_ready = self._handle_staging_chunk_arrived(
+        accepted, coverage_complete = self._handle_staging_chunk_arrived(
             room,
             chunk_idx,
             page_start,
@@ -2537,12 +2650,14 @@ class NixlKVManager(CommonKVManager):
         # Completion accounting is intentionally after geometry/writer
         # validation and persistent deduplication.
         self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
-        if writers_ready and self._staging_handler is not None:
+        if coverage_complete and self._staging_handler is not None:
+            geometry = self._staging_handler.get_chunk_geometry(room, chunk_idx)
+            if geometry is None:
+                return
             self._staging_handler.submit_chunk_scatter(
                 room,
                 chunk_idx,
-                page_start,
-                num_pages,
+                *geometry,
                 is_last_chunk=is_last_chunk,
             )
 

@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     NixlKVManager,
     NixlKVReceiver,
     NixlKVSender,
+    StagingTransferCancelledError,
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
@@ -105,7 +106,11 @@ def _fake_staging_buffer_module(mock_gather=None):
     module = types.ModuleType("sglang.srt.disaggregation.common.staging_buffer")
     module.StagingAllocator = FakeStagingAllocator
     module.compute_head_slice_params = lambda *args: (0, 1, 0, 1)
-    module.compute_staging_layout = lambda *args: (2, [256, 256], 512)
+    module.compute_staging_layout = lambda *args: (
+        2,
+        [args[4] * 64, args[4] * 64],
+        args[4] * 128,
+    )
     module.resolve_total_kv_heads = lambda kv_args, attn_tp_size: 2
     module.gather_all_layers_to_staging = mock_gather or MagicMock()
     return module
@@ -549,6 +554,16 @@ class TestNixlNotifications(CustomTestCase):
         self.assertEqual(status.received_kvs_per_pp[0], {0})
         self.assertEqual(status.expected_kvs_per_pp[0], 1)
 
+    def test_rejected_staging_interval_has_no_completion_side_effect(self):
+        mgr = self._make_manager(["5_stg_0_1_0_2_4_8_decode"])
+        mgr._handle_staging_chunk_arrived = MagicMock(return_value=(False, False))
+
+        mgr.update_transfer_status()
+
+        status = mgr.transfer_statuses[5]
+        self.assertEqual(status.received_kvs_per_pp[0], set())
+        self.assertNotIn(0, status.expected_kvs_per_pp)
+
     def test_aux_nokv_marks_zero_expected_chunks_for_pp_rank(self):
         mgr = self._make_manager(["6_aux_nokv_3"], required={6: 4})
 
@@ -744,6 +759,54 @@ class TestNixlStaging(CustomTestCase):
         self.assertEqual(
             agent.release_xfer_handle.call_args_list,
             [unittest.mock.call("cancelled"), unittest.mock.call("active")],
+        )
+
+    def test_timed_out_xfer_with_successful_cancel_does_not_fail_stop(self):
+        agent = MagicMock()
+        agent.check_xfer_state.return_value = "PROC"
+        mgr = self._make_manager(agent)
+        mgr._request_fatal_transfer_shutdown = MagicMock()
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.nixl.conn." "STAGING_HANDLE_WAIT_TIMEOUT_S",
+                0,
+            ),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.time.monotonic",
+                side_effect=[0.0, 1.0],
+            ),
+        ):
+            with self.assertRaises(StagingTransferCancelledError):
+                mgr._wait_for_xfers(["handle"], 17, 0, False)
+
+        agent.release_xfer_handle.assert_called_once_with("handle")
+        mgr._request_fatal_transfer_shutdown.assert_not_called()
+
+    def test_err_xfer_still_requests_process_tree_shutdown(self):
+        agent = MagicMock()
+        agent.check_xfer_state.return_value = "ERR"
+        mgr = self._make_manager(agent)
+        mgr._request_fatal_transfer_shutdown = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "encountered ERR"):
+            mgr._wait_for_xfers(["handle"], 17, 0, False)
+
+        mgr._request_fatal_transfer_shutdown.assert_called_once_with(
+            17, 1, reason="staging-transfer-err"
+        )
+
+    def test_cancelled_staging_send_is_marked_failed(self):
+        mgr = self._make_manager()
+        mgr._staging_ctx.send_ops[(17, 3, "decode")] = {
+            "state": "POSTED",
+            "handle": "handle",
+        }
+
+        mgr._mark_staging_send_failed(17, 3, "decode")
+
+        self.assertEqual(
+            mgr._staging_ctx.send_ops[(17, 3, "decode")]["state"], "FAILED"
         )
 
     def test_uncancelled_xfer_requests_process_tree_shutdown(self):
@@ -1008,6 +1071,49 @@ class TestNixlStaging(CustomTestCase):
         self.assertEqual(
             agent.initialize_xfer_calls[0][-1],
             b"3_stg_0_1_1_0_0_2_decode_agent",
+        )
+
+    def test_partial_staging_write_targets_each_full_layout_layer_interval(self):
+        agent = StagingFakeAgent()
+        mgr = self._make_manager(agent)
+        mgr.kv_buffer_tensors = {
+            "k_buffers": [FakeTensor(), FakeTensor()],
+            "v_buffers": [FakeTensor(), FakeTensor()],
+            "page_size": 2,
+        }
+
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.disaggregation.common.staging_buffer": (
+                    _fake_staging_buffer_module()
+                )
+            },
+        ):
+            handle = mgr.send_kvcache_staged(
+                "peer",
+                np.array([3, 4], dtype=np.int32),
+                dst_staging_ptr=0x100000,
+                dst_staging_size=1 << 20,
+                dst_gpu_id=4,
+                dst_tp_rank=0,
+                dst_attn_tp_size=1,
+                dst_kv_item_len=128,
+                notif="notif",
+                staging_buffer=FakeStagingBuffer(ptr=0x9000, size=1 << 20),
+                staging_page_offset=2,
+                staging_allocation_size=1024,
+            )
+
+        self.assertEqual(handle, "handle")
+        src_reqs = agent.get_xfer_descs_calls[0][0]
+        dst_reqs = agent.get_xfer_descs_calls[1][0]
+        self.assertEqual(src_reqs.shape, (4, 3))
+        self.assertEqual(dst_reqs.shape, (4, 3))
+        np.testing.assert_array_equal(src_reqs[:, 1], [64, 64, 64, 64])
+        np.testing.assert_array_equal(
+            dst_reqs[:, 0],
+            [0x100240, 0x1002C0, 0x100340, 0x1003C0],
         )
 
     def test_send_kvcache_staged_falls_back_when_prefill_buffer_too_small(self):

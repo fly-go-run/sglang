@@ -262,12 +262,12 @@ class StagingAllocator:
                 self.quarantined_allocations.add(alloc_id)
                 self.quarantine_count += 1
                 first_quarantine = self.quarantine_count == 1
-        logger.error(
-            "[STAGING_QUARANTINE] alloc_id=%s reason=%s quarantine_count=%s",
-            alloc_id,
-            reason,
-            self.quarantine_count,
-        )
+                logger.error(
+                    "[STAGING_QUARANTINE] alloc_id=%s reason=%s quarantine_count=%s",
+                    alloc_id,
+                    reason,
+                    self.quarantine_count,
+                )
         if first_quarantine and self._quarantine_callback is not None:
             self._quarantine_callback(alloc_id, reason)
         return True

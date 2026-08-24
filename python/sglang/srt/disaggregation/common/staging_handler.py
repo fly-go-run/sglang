@@ -108,6 +108,7 @@ class StagingRoomLifecycle:
     chunk_states: dict = dataclasses.field(default_factory=dict)
     chunk_geometry: dict = dataclasses.field(default_factory=dict)
     seen_writer_slots: dict = dataclasses.field(default_factory=dict)
+    writer_intervals: dict = dataclasses.field(default_factory=dict)
 
 
 class DecodeStagingHandler:
@@ -387,6 +388,35 @@ class DecodeStagingHandler:
             return prefill_tp // max(1, self.decode_tp)
         return 1
 
+    @staticmethod
+    def _chunk_coverage_complete_locked(
+        lifecycle: StagingRoomLifecycle,
+        chunk_idx: int,
+        num_writers: int,
+    ) -> bool:
+        expected_start, expected_pages = lifecycle.chunk_geometry[chunk_idx]
+        expected_end = expected_start + expected_pages
+        writer_intervals = lifecycle.writer_intervals.get(chunk_idx, {})
+        if len(writer_intervals) != num_writers:
+            return False
+        for intervals in writer_intervals.values():
+            cursor = expected_start
+            for start, end in sorted(intervals):
+                if start != cursor:
+                    return False
+                cursor = end
+            if cursor != expected_end:
+                return False
+        return True
+
+    def get_chunk_geometry(self, room: int, chunk_idx: int):
+        """Return immutable expected geometry under the lifecycle lock."""
+        lifecycle = self._room_lifecycles.get(room)
+        if lifecycle is None:
+            return None
+        with lifecycle.lock:
+            return lifecycle.chunk_geometry.get(chunk_idx)
+
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
         """Factory: create handler. Raises if staging infra is missing."""
@@ -647,7 +677,7 @@ class DecodeStagingHandler:
         num_pages: int,
         is_last_chunk: bool = False,
     ) -> bool:
-        """Submit scatter for an intermediate chunk whose writers all arrived.
+        """Submit scatter after every writer covers the complete chunk.
 
         Called from decode_thread.  Records a CUDA event on decode_req so
         the main thread can later check completion and free the allocation.
@@ -698,6 +728,18 @@ class DecodeStagingHandler:
                     violation = (
                         f"[STAGING_GEOMETRY] missing allocation room={room} "
                         f"chunk={chunk_idx}"
+                    )
+                elif self._requires_last_writer_slots and not (
+                    self._chunk_coverage_complete_locked(
+                        lifecycle, chunk_idx, self.num_writers_for(decode_req)
+                    )
+                ):
+                    lifecycle.terminal = True
+                    violation = (
+                        f"[STAGING_COVERAGE] scatter before complete coverage "
+                        f"room={room} chunk={chunk_idx} "
+                        f"expected={expected_geometry} "
+                        f"actual={lifecycle.writer_intervals.get(chunk_idx, {})}"
                     )
                 else:
                     alloc_id, staging_offset, _, _, allocated_pages = chunk_infos[
@@ -754,12 +796,7 @@ class DecodeStagingHandler:
         peer_name="",
         chunk_writer_counts: Optional[dict] = None,
     ) -> Tuple[bool, bool]:
-        """Validate and record a staging arrival from any transport.
-
-        Accumulates writer arrivals in *chunk_writer_counts* and submits scatter
-        once all writers for this chunk have reported in. Returns True if scatter
-        was submitted.
-        """
+        """Validate and accumulate one writer's covered page interval."""
         legacy_submit = chunk_writer_counts is None
         if legacy_submit:
             # Mooncake's existing six-argument call passes its writer table in
@@ -777,6 +814,9 @@ class DecodeStagingHandler:
             )
             return (False, False)
         violation = None
+        accepted = False
+        coverage_complete = False
+        expected_geometry = None
         with lifecycle.lock:
             if lifecycle.terminal:
                 count = self.invariant_counters.increment("scatter_after_terminal")
@@ -790,14 +830,30 @@ class DecodeStagingHandler:
                 return (False, False)
             state = lifecycle.chunk_states.get(chunk_idx)
             expected_geometry = lifecycle.chunk_geometry.get(chunk_idx)
-            if expected_geometry != (page_start, num_pages):
+            if expected_geometry is None:
                 lifecycle.terminal = True
                 violation = (
-                    f"[STAGING_GEOMETRY] notification mismatch room={room} "
-                    f"chunk={chunk_idx} state={state} got={(page_start, num_pages)} "
-                    f"expected={expected_geometry}"
+                    f"[STAGING_GEOMETRY] notification without allocation "
+                    f"room={room} chunk={chunk_idx} state={state}"
                 )
             else:
+                expected_start, expected_pages = expected_geometry
+                expected_end = expected_start + expected_pages
+                page_end = page_start + num_pages
+                if (
+                    num_pages <= 0
+                    or page_start < expected_start
+                    or page_end > expected_end
+                ):
+                    lifecycle.terminal = True
+                    violation = (
+                        f"[STAGING_GEOMETRY] notification out of bounds "
+                        f"room={room} chunk={chunk_idx} state={state} "
+                        f"got=[{page_start},{page_end}) "
+                        f"expected=[{expected_start},{expected_end})"
+                    )
+
+            if violation is None:
                 num_writers = self.num_writers_for(decode_req)
                 if legacy_submit:
                     writer_slot = peer_name
@@ -814,19 +870,42 @@ class DecodeStagingHandler:
                         f"expected=0..{num_writers - 1}"
                     )
                 else:
-                    seen = lifecycle.seen_writer_slots.setdefault(chunk_idx, set())
-                    if writer_slot in seen:
+                    interval = (page_start, page_end)
+                    chunk_intervals = lifecycle.writer_intervals.setdefault(
+                        chunk_idx, {}
+                    )
+                    writer_intervals = chunk_intervals.setdefault(writer_slot, set())
+                    if interval in writer_intervals:
+                        count = self.invariant_counters.increment("duplicate_writer")
                         logger.warning(
-                            "[STAGING_DUPLICATE_WRITER] room=%s chunk=%s "
-                            "engine_rank=%s writer_slot=%s peer=%s",
+                            "[STAGING_DUPLICATE_WRITER] duplicate_writer=%s "
+                            "room=%s chunk=%s "
+                            "engine_rank=%s writer_slot=%s interval=%s peer=%s",
+                            count,
                             room,
                             chunk_idx,
                             engine_rank,
                             writer_slot,
+                            interval,
                             peer_name,
                         )
                         return (False, False)
-                    if state != "WRITABLE":
+                    overlap = next(
+                        (
+                            existing
+                            for existing in writer_intervals
+                            if max(existing[0], page_start) < min(existing[1], page_end)
+                        ),
+                        None,
+                    )
+                    if overlap is not None:
+                        lifecycle.terminal = True
+                        violation = (
+                            f"[STAGING_GEOMETRY] overlapping writer interval "
+                            f"room={room} chunk={chunk_idx} writer_slot={writer_slot} "
+                            f"got={interval} existing={overlap}"
+                        )
+                    elif state != "WRITABLE":
                         lifecycle.terminal = True
                         violation = (
                             f"[STAGING_LIFECYCLE] new writer after scatter "
@@ -834,20 +913,26 @@ class DecodeStagingHandler:
                             f"writer_slot={writer_slot}"
                         )
                     else:
+                        writer_intervals.add(interval)
+                        seen = lifecycle.seen_writer_slots.setdefault(chunk_idx, set())
                         seen.add(writer_slot)
                         writer_counts = chunk_writer_counts[room][chunk_idx]
+                        coverage_key = (writer_slot, page_start, page_end)
                         if hasattr(writer_counts, "add"):
-                            writer_counts.add(writer_slot)
+                            writer_counts.add(coverage_key)
                         else:
-                            writer_counts.append(writer_slot)
+                            writer_counts.append(coverage_key)
                         self._note_staging_progress(decode_req)
-                        writers_ready = len(seen) == num_writers
+                        coverage_complete = self._chunk_coverage_complete_locked(
+                            lifecycle, chunk_idx, num_writers
+                        )
+                        accepted = True
                         if not legacy_submit:
-                            return (True, writers_ready)
+                            return (accepted, coverage_complete)
         if violation is None and legacy_submit:
-            if writers_ready:
-                self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
-            return (True, writers_ready)
+            if coverage_complete:
+                self.submit_chunk_scatter(room, chunk_idx, *expected_geometry)
+            return (accepted, coverage_complete)
         logger.error(violation)
         self.fail_staging_room(room, violation)
         return (False, False)
@@ -869,6 +954,8 @@ class DecodeStagingHandler:
             )
             return False
         with lifecycle.lock:
+            if lifecycle.terminal:
+                return False
             if not lifecycle.chunk_geometry:
                 decode_req = self._room_to_decode_req.get(room)
                 if decode_req is not None:
@@ -877,16 +964,30 @@ class DecodeStagingHandler:
                 return False
             chunk_idx = max(lifecycle.chunk_geometry)
             page_start, num_pages = lifecycle.chunk_geometry[chunk_idx]
-            decode_req = self._room_to_decode_req.get(room)
-            if decode_req is None or (
-                self._requires_last_writer_slots
-                and len(lifecycle.seen_writer_slots.get(chunk_idx, set()))
-                < self.num_writers_for(decode_req)
-            ):
-                return False
             state = lifecycle.chunk_states.get(chunk_idx)
             if state in ("SCATTER_SUBMITTED", "SCATTER_DONE"):
                 return True
+            decode_req = self._room_to_decode_req.get(room)
+            if decode_req is None:
+                return False
+            if self._requires_last_writer_slots and not (
+                self._chunk_coverage_complete_locked(
+                    lifecycle, chunk_idx, self.num_writers_for(decode_req)
+                )
+            ):
+                lifecycle.terminal = True
+                violation = (
+                    f"[STAGING_COVERAGE] completion with incomplete coverage "
+                    f"room={room} chunk={chunk_idx} "
+                    f"expected={lifecycle.chunk_geometry[chunk_idx]} "
+                    f"actual={lifecycle.writer_intervals.get(chunk_idx, {})}"
+                )
+            else:
+                violation = None
+        if violation is not None:
+            logger.error(violation)
+            self.fail_staging_room(room, violation)
+            return False
         return self.submit_chunk_scatter(
             room,
             chunk_idx,
