@@ -11,6 +11,8 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import random
+import signal
 import struct
 import threading
 import time
@@ -121,6 +123,7 @@ class DecodeStagingHandler:
         total_kv_heads: int,
         tp_rank: int,
         scheduler,
+        fatal_shutdown=None,
     ):
         self.kv_manager = kv_manager
         self.staging_allocator = staging_allocator
@@ -129,12 +132,16 @@ class DecodeStagingHandler:
         self.total_kv_heads = total_kv_heads
         self.tp_rank = tp_rank
         self.scheduler = scheduler
+        self._fatal_shutdown = fatal_shutdown
         self._room_to_decode_req: dict = {}
         # Failure paths clear decode_req.kv_receiver before unregistering the
         # room, so retain the receiver needed to release staging allocations.
         self._room_to_receiver: dict = {}
         self._room_lifecycles: dict[int, StagingRoomLifecycle] = {}
         self.invariant_counters = staging_allocator.invariant_counters
+        self._quarantine_exit_lock = threading.Lock()
+        self._quarantine_exit_timer = None
+        self.staging_allocator.set_quarantine_callback(self._on_first_quarantine)
         self.staging_allocator._staging_handler = self
         self._wm_subscribers: dict = {}
         self._wm_next_generation = 0
@@ -405,11 +412,72 @@ class DecodeStagingHandler:
             total_kv_heads=total_kv_heads,
             tp_rank=tp_rank,
             scheduler=scheduler,
+            fatal_shutdown=getattr(
+                kv_manager, "_request_fatal_transfer_shutdown", None
+            ),
         )
 
     # ------------------------------------------------------------------
     # Registration: called from main thread (DecodeTransferQueue)
     # ------------------------------------------------------------------
+
+    def _set_dynamo_notready_best_effort(self) -> None:
+        """Use an integration-provided Dynamo status hook when one exists."""
+        for name in ("set_dynamo_system_status", "set_system_status"):
+            setter = getattr(self.scheduler, name, None)
+            if not callable(setter):
+                continue
+            try:
+                setter("notready")
+                logger.error(
+                    "[STAGING_QUARANTINE] Dynamo system status set to notready"
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "[STAGING_QUARANTINE] failed to set Dynamo system status "
+                    "notready via %s",
+                    name,
+                )
+        logger.warning(
+            "[STAGING_QUARANTINE] no Dynamo system-status hook is available; "
+            "continuing with process-level exit"
+        )
+
+    def _on_first_quarantine(self, alloc_id: int, reason: str) -> None:
+        """Mark notready and arm exactly one process-level fail-stop timer."""
+        self._set_dynamo_notready_best_effort()
+        with self._quarantine_exit_lock:
+            if self._quarantine_exit_timer is not None:
+                return
+            delay_s = random.uniform(0.0, 60.0)
+
+            def request_exit():
+                logger.critical(
+                    "[STAGING_QUARANTINE_EXIT] alloc_id=%s delay_s=%.3f "
+                    "reason=%s quarantine_count=%s",
+                    alloc_id,
+                    delay_s,
+                    reason,
+                    self.staging_allocator.quarantine_count,
+                )
+                if self._fatal_shutdown is None:
+                    os.kill(os.getppid(), signal.SIGQUIT)
+                else:
+                    self._fatal_shutdown(
+                        -1,
+                        self.staging_allocator.quarantine_count,
+                        reason="staging-quarantine",
+                    )
+
+            timer = threading.Timer(delay_s, request_exit)
+            timer.daemon = True
+            self._quarantine_exit_timer = timer
+            timer.start()
+        logger.error(
+            "[STAGING_QUARANTINE_EXIT] scheduled process-level exit in %.3fs",
+            delay_s,
+        )
 
     def _outstanding_alloc_ids(self, decode_req, receiver) -> set[int]:
         alloc_ids = {
