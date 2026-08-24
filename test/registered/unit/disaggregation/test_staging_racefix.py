@@ -159,6 +159,35 @@ class TestStagingRaceFix(CustomTestCase):
         handler._scatter_region.assert_called_once()
         self.assertEqual(lifecycle.chunk_states[0], "SCATTER_SUBMITTED")
 
+    def test_legacy_shared_arrival_api_still_submits_scatter(self):
+        handler = object.__new__(DecodeStagingHandler)
+        handler.decode_tp = 1
+        receiver = SimpleNamespace(
+            prefill_info=SimpleNamespace(attn_tp_size=1),
+            chunk_staging_infos=[(3, 64, 0, 128, 2)],
+        )
+        decode_req = SimpleNamespace(
+            kv_receiver=receiver,
+            _staging_progress_lock=threading.Lock(),
+            _staging_stall_failed=False,
+            _staging_stall_since=None,
+        )
+        handler._room_to_decode_req = {4: decode_req}
+        handler._room_lifecycles = {
+            4: StagingRoomLifecycle(
+                chunk_states={0: "WRITABLE"},
+                chunk_geometry={0: (0, 2)},
+            )
+        }
+        handler.submit_chunk_scatter = MagicMock(return_value=True)
+        counts = defaultdict(lambda: defaultdict(list))
+
+        self.assertEqual(
+            handler.handle_chunk_arrived(4, 0, 0, 2, "session-a", counts),
+            (True, True),
+        )
+        handler.submit_chunk_scatter.assert_called_once_with(4, 0, 0, 2)
+
     def test_late_staging_req_after_scatter_is_rejected(self):
         allocator = _cpu_allocator()
         allocator.assign = MagicMock()
