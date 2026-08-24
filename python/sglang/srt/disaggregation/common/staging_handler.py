@@ -85,6 +85,23 @@ class PrefillStagingContext:
     # keeps advancing the wait is backlog, not a stall, and the stall clock
     # restarts from the latest advance.
     watermark_wait_last_wm: dict = dataclasses.field(default_factory=dict)
+    # Persistent per-(room, chunk, destination) send state. Entries survive
+    # defer/requeue and are removed only when the room is cleared.
+    send_ops: dict = dataclasses.field(default_factory=dict)
+    send_ops_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    invariant_counters: object = None
+
+
+@dataclasses.dataclass
+class StagingRoomLifecycle:
+    """Decode-side terminal fence and persistent per-chunk tombstones."""
+
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    terminal: bool = False
+    quarantined: bool = False
+    chunk_states: dict = dataclasses.field(default_factory=dict)
+    chunk_geometry: dict = dataclasses.field(default_factory=dict)
+    seen_writer_slots: dict = dataclasses.field(default_factory=dict)
 
 
 class DecodeStagingHandler:

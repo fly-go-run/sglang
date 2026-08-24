@@ -88,6 +88,10 @@ GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
 
+class StagingPostAmbiguousError(RuntimeError):
+    """The transport may have accepted a post before raising."""
+
+
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
     if kinds is None:
         return ["VRAM"] * expected_len
@@ -501,8 +505,12 @@ class NixlKVManager(CommonKVManager):
         from sglang.srt.disaggregation.common.staging_handler import (
             PrefillStagingContext,
         )
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            StagingInvariantCounters,
+        )
 
         self._staging_ctx = PrefillStagingContext()
+        self._staging_ctx.invariant_counters = StagingInvariantCounters()
 
     def _init_staging_decode_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1066,7 +1074,6 @@ class NixlKVManager(CommonKVManager):
         while True:
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
-            handles: List[Any] = []
             try:
                 if self.check_status(room) == KVPoll.Failed:
                     continue
@@ -1101,6 +1108,8 @@ class NixlKVManager(CommonKVManager):
                 staging_deferred = False
 
                 for req in reqs_to_be_processed:
+                    req_handles: List[Any] = []
+                    staging_handled = False
                     assert room == req.room
                     if req.is_dummy():
                         continue
@@ -1147,10 +1156,18 @@ class NixlKVManager(CommonKVManager):
                             and decode_tp_size != self.attn_tp_size
                             and dst_info.staging is not None
                         )
+                        if use_staging and self._is_staging_send_done(
+                            room, kv_chunk.chunk_id, req.agent_name
+                        ):
+                            continue
 
                         kv_xfer_handle = None
                         if use_staging:
-                            kv_xfer_handle, deferred = self._do_staging_transfer(
+                            (
+                                kv_xfer_handle,
+                                deferred,
+                                staging_handled,
+                            ) = self._do_staging_transfer(
                                 staging_strategy,
                                 kv_chunk,
                                 src_prefill_kv_indices,
@@ -1164,12 +1181,28 @@ class NixlKVManager(CommonKVManager):
                                 # pick it up again on the next pop.
                                 staging_deferred = True
                                 break
-                            # kv_xfer_handle is None here means staging
-                            # send_kvcache_staged() returned None (e.g.
-                            # decode buffer too small) -- fall through to
-                            # the slice path below.
+                            if kv_xfer_handle is not None:
+                                # Every gather for this worker uses the same
+                                # source buffer. Wait for terminal completion
+                                # before the loop can reach another destination
+                                # and gather into it again.
+                                try:
+                                    self._wait_for_xfers(
+                                        [kv_xfer_handle],
+                                        room,
+                                        worker_idx,
+                                        kv_chunk.is_last_chunk,
+                                    )
+                                except Exception:
+                                    self._request_fatal_transfer_shutdown(
+                                        room,
+                                        1,
+                                        reason="staging-source-not-terminal",
+                                    )
+                                    raise
+                                kv_xfer_handle = None
 
-                        if kv_xfer_handle is None:
+                        if kv_xfer_handle is None and not staging_handled:
                             if self.is_mla_backend or (
                                 decode_tp_size == self.attn_tp_size
                             ):
@@ -1190,7 +1223,7 @@ class NixlKVManager(CommonKVManager):
                                         ),
                                     )
                                 else:
-                                    handles.extend(
+                                    req_handles.extend(
                                         self.send_kvcache_mixed(
                                             req.agent_name,
                                             src_prefill_kv_indices,
@@ -1207,7 +1240,7 @@ class NixlKVManager(CommonKVManager):
                                 )
 
                         if kv_xfer_handle is not None:
-                            handles.append(kv_xfer_handle)
+                            req_handles.append(kv_xfer_handle)
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1224,7 +1257,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                             )
-                            handles.extend(
+                            req_handles.extend(
                                 h for h in state_xfer_handles if h is not None
                             )
 
@@ -1246,65 +1279,22 @@ class NixlKVManager(CommonKVManager):
                             req.dst_aux_index,
                             aux_notif,
                         )
-                        handles.append(aux_xfer_handle)
+                        req_handles.append(aux_xfer_handle)
+
+                    self._wait_for_xfers(
+                        req_handles,
+                        room,
+                        worker_idx,
+                        kv_chunk.is_last_chunk,
+                    )
+                    if staging_handled:
+                        self._mark_staging_send_done(
+                            room, kv_chunk.chunk_id, req.agent_name
+                        )
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
                     continue
-
-                handle_wait_started = time.monotonic()
-                next_handle_log_s = 5.0
-                while handles:
-                    all_done = True
-                    pending_count = 0
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                            pending_count += 1
-                    if all_done:
-                        break
-                    elapsed_s = time.monotonic() - handle_wait_started
-                    if elapsed_s >= next_handle_log_s:
-                        logger.warning(
-                            "[STAGING_WAIT_HANDLE] worker=%s room=%s "
-                            "elapsed_s=%.3f pending=%s total=%s last_chunk=%s",
-                            worker_idx,
-                            room,
-                            elapsed_s,
-                            pending_count,
-                            len(handles),
-                            kv_chunk.is_last_chunk,
-                        )
-                        next_handle_log_s += 10.0
-                    if elapsed_s > STAGING_HANDLE_WAIT_TIMEOUT_S:
-                        # Cancel our writes before the decode-side stall guard
-                        # (60s) frees the target allocations for reuse. A
-                        # successful cancel can fail just this room; a failed
-                        # cancel must escalate because slot reuse is unsafe.
-                        uncancelled = self._cancel_pending_xfers(handles, room)
-                        if uncancelled:
-                            # Request-level cleanup is unsafe in this state:
-                            # decode may free/reuse the staging slot while the
-                            # NIC still owns an active WRITE. Escalate to the
-                            # existing process-tree shutdown path instead of
-                            # allowing a late RDMA write to corrupt another
-                            # request's KV cache.
-                            self._request_fatal_transfer_shutdown(
-                                room, len(uncancelled)
-                            )
-                        raise RuntimeError(
-                            f"[STAGING_HANDLE_TIMEOUT] room={room} NIXL "
-                            f"transfer not DONE after {elapsed_s:.0f}s "
-                            f"(pending={pending_count}/{len(handles)}, "
-                            f"last_chunk={kv_chunk.is_last_chunk}); cancelled "
-                            f"in-flight transfers and failed the request."
-                        )
-                    time.sleep(0)
 
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
@@ -1317,6 +1307,7 @@ class NixlKVManager(CommonKVManager):
                         for k in list(self._staging_ctx.prefetch_requested):
                             if k[0] == room:
                                 self._staging_ctx.prefetch_requested.discard(k)
+                        self._clear_staging_send_ops(room)
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
@@ -1332,6 +1323,48 @@ class NixlKVManager(CommonKVManager):
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
 
+    def _wait_for_xfers(
+        self, handles: List[Any], room: int, worker_idx: int, is_last_chunk: bool
+    ) -> None:
+        """Wait for handles to become terminal before their source is reusable."""
+        handle_wait_started = time.monotonic()
+        next_handle_log_s = 5.0
+        while handles:
+            pending_count = 0
+            for handle in handles:
+                state = self.agent.check_xfer_state(handle)
+                if state == "ERR":
+                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+                if state != "DONE":
+                    pending_count += 1
+            if pending_count == 0:
+                return
+            elapsed_s = time.monotonic() - handle_wait_started
+            if elapsed_s >= next_handle_log_s:
+                logger.warning(
+                    "[STAGING_WAIT_HANDLE] worker=%s room=%s elapsed_s=%.3f "
+                    "pending=%s total=%s last_chunk=%s",
+                    worker_idx,
+                    room,
+                    elapsed_s,
+                    pending_count,
+                    len(handles),
+                    is_last_chunk,
+                )
+                next_handle_log_s += 10.0
+            if elapsed_s > STAGING_HANDLE_WAIT_TIMEOUT_S:
+                uncancelled = self._cancel_pending_xfers(handles, room)
+                if uncancelled:
+                    self._request_fatal_transfer_shutdown(room, len(uncancelled))
+                raise RuntimeError(
+                    f"[STAGING_HANDLE_TIMEOUT] room={room} NIXL transfer not "
+                    f"DONE after {elapsed_s:.0f}s "
+                    f"(pending={pending_count}/{len(handles)}, "
+                    f"last_chunk={is_last_chunk}); cancelled in-flight "
+                    f"transfers and failed the request."
+                )
+            time.sleep(0)
+
     def _cancel_pending_xfers(self, handles: List[Any], room: int) -> List[Any]:
         """Cancel active NIXL handles and return those still unsafe to reuse."""
         uncancelled = []
@@ -1346,14 +1379,16 @@ class NixlKVManager(CommonKVManager):
         return uncancelled
 
     @staticmethod
-    def _request_fatal_transfer_shutdown(room: int, pending_count: int) -> None:
-        """Use SGLang's process-tree shutdown when active RDMA cannot cancel."""
+    def _request_fatal_transfer_shutdown(
+        room: int, pending_count: int, reason: str = "uncancelled-transfer"
+    ) -> None:
+        """Use SGLang's SIGQUIT process-tree shutdown for staging fail-stop."""
         logger.critical(
-            "[STAGING_HANDLE_TIMEOUT] room=%s has %s active NIXL transfer(s) "
-            "that could not be cancelled; requesting process-tree shutdown "
-            "before decode can reuse their staging slots.",
+            "[STAGING_FATAL_EXIT] room=%s count=%s reason=%s; requesting "
+            "process-tree shutdown before staging memory can be reused.",
             room,
             pending_count,
+            reason,
         )
         os.kill(os.getppid(), signal.SIGQUIT)
 
@@ -1811,9 +1846,18 @@ class NixlKVManager(CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
+        try:
+            state = self.agent.transfer(xfer_handle)
+        except Exception as exc:
+            raise StagingPostAmbiguousError(
+                "[STAGING_POSTING] NIXL transfer raised after initialize_xfer; "
+                "the source buffer cannot be safely reused"
+            ) from exc
         if state == "ERR":
-            raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
+            raise StagingPostAmbiguousError(
+                "[STAGING_POSTING] NIXL bulk transfer returned ERR; "
+                "post completion is ambiguous"
+            )
         return xfer_handle
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -1841,24 +1885,51 @@ class NixlKVManager(CommonKVManager):
         dst_info: KVArgsRegisterInfo,
         queue: FastQueue,
     ):
-        """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
+        """Attempt staging transfer for one chunk.
+
+        Returns ``(xfer_handle, deferred, handled)``. ``handled`` is true for
+        an already POSTED/DONE operation so defer retries never fall through
+        to a second RDMA post or the direct-slice fallback.
 
         Mirrors mooncake._do_staging_transfer semantics:
           - staging not ready (watermark/alloc pending) -> ``queue.put(kv_chunk)``
-            re-enqueue the chunk and return ``(None, True)``. Caller should
+            re-enqueue the chunk and return ``(None, True, False)``. Caller should
             ``break`` out of the per-req loop and ``continue`` the worker
             main loop without updating room status -- the chunk will be
             retried on the next pop.
           - oversized chunk (will never fit) -> raise RuntimeError.
-          - staging successfully posted -> return ``(handle, False)``. The
-            caller appends the handle to the per-chunk handle list and
-            busy-polls it to DONE alongside other handles.
-          - send_kvcache_staged returned None (decode buffer too small,
-            kv_buffer_tensors missing, etc.) -> return ``(None, False)``,
-            signalling the caller to fall back to send_kvcache_slice.
+          - staging successfully posted -> return ``(handle, False, True)``.
         """
         page_start = kv_chunk.index_slice.start
         num_pages = len(kv_chunk.prefill_kv_indices)
+        op_key = (kv_chunk.room, kv_chunk.chunk_id, req.agent_name)
+
+        with self._staging_ctx.send_ops_lock:
+            operation = self._staging_ctx.send_ops.get(op_key)
+            if operation is not None:
+                state = operation["state"]
+                if state == "DONE":
+                    return (None, False, True)
+                if state == "POSTED":
+                    return (operation["handle"], False, True)
+                if state == "POSTING":
+                    count = self._staging_ctx.invariant_counters.increment(
+                        "duplicate_post"
+                    )
+                    logger.error(
+                        "[STAGING_INVARIANT] duplicate_post=%s key=%s "
+                        "state=POSTING; requesting fail-stop",
+                        count,
+                        op_key,
+                    )
+                    self._request_fatal_transfer_shutdown(
+                        kv_chunk.room,
+                        1,
+                        reason="duplicate-post-during-posting",
+                    )
+                    raise RuntimeError(
+                        f"[STAGING_DUPLICATE_POST] ambiguous operation {op_key}"
+                    )
 
         ready, chunk_idx, c_offset, c_round, c_end = staging_strategy.check_ready(
             req, page_start, num_pages, session_id=req.agent_name
@@ -1923,7 +1994,7 @@ class NixlKVManager(CommonKVManager):
             with self._staging_ctx.watermark_cv:
                 self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
             queue.put(kv_chunk)
-            return (None, True)
+            return (None, True, False)
 
         self._staging_ctx.watermark_wait_started.pop(wait_key, None)
         self._staging_ctx.watermark_wait_last_log.pop(wait_key, None)
@@ -1934,26 +2005,74 @@ class NixlKVManager(CommonKVManager):
             f"_{self.kv_args.engine_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
-        handle = self.send_kvcache_staged(
-            req.agent_name,
-            src_prefill_kv_indices,
-            dst_info.staging.base_ptr + c_offset,
-            dst_info.staging.total_size - c_offset,
-            dst_info.gpu_id,
-            dst_info.decode_tp_rank,
-            dst_info.decode_tp_size,
-            dst_info.dst_kv_item_len,
-            notif_tag,
-            staging_buffer=staging_strategy.staging_buffer,
-        )
+        with self._staging_ctx.send_ops_lock:
+            operation = self._staging_ctx.send_ops.setdefault(
+                op_key, {"state": "PENDING", "handle": None}
+            )
+            if operation["state"] != "PENDING":
+                count = self._staging_ctx.invariant_counters.increment("duplicate_post")
+                logger.error(
+                    "[STAGING_INVARIANT] duplicate_post=%s key=%s state=%s",
+                    count,
+                    op_key,
+                    operation["state"],
+                )
+                return (operation["handle"], False, True)
+            operation["state"] = "POSTING"
+        try:
+            handle = self.send_kvcache_staged(
+                req.agent_name,
+                src_prefill_kv_indices,
+                dst_info.staging.base_ptr + c_offset,
+                dst_info.staging.total_size - c_offset,
+                dst_info.gpu_id,
+                dst_info.decode_tp_rank,
+                dst_info.decode_tp_size,
+                dst_info.dst_kv_item_len,
+                notif_tag,
+                staging_buffer=staging_strategy.staging_buffer,
+            )
+        except StagingPostAmbiguousError:
+            self._request_fatal_transfer_shutdown(
+                kv_chunk.room,
+                1,
+                reason="ambiguous-staging-post",
+            )
+            raise
+        except Exception:
+            with self._staging_ctx.send_ops_lock:
+                operation["state"] = "PENDING"
+            raise
         if handle is None:
+            with self._staging_ctx.send_ops_lock:
+                operation["state"] = "PENDING"
             raise RuntimeError(
                 f"[Staging] staged transfer cannot fit chunk "
                 f"(room={kv_chunk.room}, chunk_idx={chunk_idx}, "
                 f"pages={num_pages}); increase the staging pool or reduce "
                 f"chunked_prefill_size"
             )
-        return (handle, False)
+        with self._staging_ctx.send_ops_lock:
+            operation["handle"] = handle
+            operation["state"] = "POSTED"
+        return (handle, False, True)
+
+    def _mark_staging_send_done(self, room: int, chunk_id: int, agent_name: str):
+        op_key = (room, chunk_id, agent_name)
+        with self._staging_ctx.send_ops_lock:
+            operation = self._staging_ctx.send_ops.get(op_key)
+            if operation is not None and operation["state"] == "POSTED":
+                operation["state"] = "DONE"
+
+    def _is_staging_send_done(self, room: int, chunk_id: int, agent_name: str) -> bool:
+        with self._staging_ctx.send_ops_lock:
+            operation = self._staging_ctx.send_ops.get((room, chunk_id, agent_name))
+            return operation is not None and operation["state"] == "DONE"
+
+    def _clear_staging_send_ops(self, room: int) -> None:
+        with self._staging_ctx.send_ops_lock:
+            for key in [key for key in self._staging_ctx.send_ops if key[0] == room]:
+                self._staging_ctx.send_ops.pop(key, None)
 
     def send_aux(
         self,
@@ -2718,6 +2837,7 @@ class NixlKVSender(CommonKVSender):
                 for key in self.kv_mgr._staging_ctx.prefetch_requested
                 if key[0] != self.bootstrap_room
             }
+            self.kv_mgr._clear_staging_send_ops(self.bootstrap_room)
 
     def failure_exception(self):
         exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
