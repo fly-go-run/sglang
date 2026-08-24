@@ -711,9 +711,9 @@ class DecodeStagingHandler:
         chunk_idx: int,
         page_start: int,
         num_pages: int,
-        engine_rank: int,
-        peer_name: str,
-        chunk_writer_counts: dict,
+        engine_rank,
+        peer_name="",
+        chunk_writer_counts: Optional[dict] = None,
     ) -> Tuple[bool, bool]:
         """Validate and record a staging arrival from any transport.
 
@@ -721,6 +721,13 @@ class DecodeStagingHandler:
         once all writers for this chunk have reported in. Returns True if scatter
         was submitted.
         """
+        legacy_submit = chunk_writer_counts is None
+        if legacy_submit:
+            # Mooncake's existing six-argument call passes its writer table in
+            # peer_name and a session identity in engine_rank. Keep that local
+            # API compatible without changing its wire format or source file.
+            chunk_writer_counts = peer_name
+            peer_name = str(engine_rank)
         lifecycle = self._room_lifecycles.get(room)
         decode_req = self._room_to_decode_req.get(room)
         if lifecycle is None or decode_req is None:
@@ -756,9 +763,14 @@ class DecodeStagingHandler:
                 )
             else:
                 num_writers = self.num_writers_for(decode_req)
-                prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-                writer_slot = (engine_rank % prefill_tp) % num_writers
-                if writer_slot not in range(num_writers):
+                if legacy_submit:
+                    writer_slot = peer_name
+                    writer_valid = True
+                else:
+                    prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+                    writer_slot = (engine_rank % prefill_tp) % num_writers
+                    writer_valid = writer_slot in range(num_writers)
+                if not writer_valid:
                     lifecycle.terminal = True
                     violation = (
                         f"[STAGING_WRITER] invalid slot room={room} chunk={chunk_idx} "
@@ -779,9 +791,19 @@ class DecodeStagingHandler:
                         )
                         return (False, False)
                     seen.add(writer_slot)
-                    chunk_writer_counts[room][chunk_idx].add(writer_slot)
+                    writer_counts = chunk_writer_counts[room][chunk_idx]
+                    if hasattr(writer_counts, "add"):
+                        writer_counts.add(writer_slot)
+                    else:
+                        writer_counts.append(writer_slot)
                     self._note_staging_progress(decode_req)
-                    return (True, len(seen) == num_writers)
+                    writers_ready = len(seen) == num_writers
+                    if not legacy_submit:
+                        return (True, writers_ready)
+        if violation is None and legacy_submit:
+            if writers_ready:
+                self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            return (True, writers_ready)
         logger.error(violation)
         self.fail_staging_room(room, violation)
         return (False, False)
