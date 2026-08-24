@@ -46,6 +46,9 @@ STAGING_WATERMARK_SEND_ERROR_EVERY_S = 30.0
 STAGING_ROOM_STALL_TIMEOUT_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_STALL_TIMEOUT_S", "60")
 )
+STAGING_SCATTER_DRAIN_TIMEOUT_S = float(
+    os.environ.get("SGLANG_DISAGG_STAGING_SCATTER_DRAIN_TIMEOUT_S", "5")
+)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -514,6 +517,39 @@ class DecodeStagingHandler:
             self.staging_allocator.quarantine(alloc_id, reason)
         return alloc_ids
 
+    def _drain_scatter_bounded(self, room: int) -> None:
+        """Wait briefly for claimed scatter without an unbounded synchronize."""
+        stream = self.staging_allocator._scatter_stream
+        if stream is None:
+            return
+        deadline = time.monotonic() + STAGING_SCATTER_DRAIN_TIMEOUT_S
+        while True:
+            try:
+                if stream.query():
+                    return
+            except Exception:
+                logger.exception(
+                    "[STAGING_FATAL_EXIT] room=%s scatter query failed", room
+                )
+                if self._fatal_shutdown is None:
+                    os.kill(os.getppid(), signal.SIGQUIT)
+                else:
+                    self._fatal_shutdown(room, 1, reason="staging-scatter-query-failed")
+                raise
+            if time.monotonic() >= deadline:
+                reason = "staging-scatter-drain-timeout"
+                logger.critical(
+                    "[STAGING_FATAL_EXIT] room=%s scatter did not drain in %.3fs",
+                    room,
+                    STAGING_SCATTER_DRAIN_TIMEOUT_S,
+                )
+                if self._fatal_shutdown is None:
+                    os.kill(os.getppid(), signal.SIGQUIT)
+                else:
+                    self._fatal_shutdown(room, 1, reason=reason)
+                raise RuntimeError(f"[STAGING_SCATTER_DRAIN_TIMEOUT] room={room}")
+            time.sleep(0.001)
+
     def fence_failed_room(self, room: int, reason: str) -> None:
         """Fence late scatter before the scheduler releases request KV pages."""
         alloc_ids = self._terminalize_room(room, reason)
@@ -521,9 +557,7 @@ class DecodeStagingHandler:
             return
         # The quarantine callback has already armed the independent 0-60s
         # process exit. A stuck CUDA drain therefore cannot suppress fail-stop.
-        stream = self.staging_allocator._scatter_stream
-        if stream is not None:
-            stream.synchronize()
+        self._drain_scatter_bounded(room)
 
     def fail_staging_room(self, room: int, reason: str) -> None:
         """Fail closed after a staging invariant violation."""
@@ -574,12 +608,11 @@ class DecodeStagingHandler:
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Release allocations left by a failed or aborted staging room."""
         # Any allocation left at unregister has an outstanding remote grant.
-        # Quarantine it before draining scatter; the timer is armed first so a
-        # stuck CUDA synchronize cannot prevent process-level fail-stop.
+        # Quarantine it before the bounded scatter drain; the independent exit
+        # timer is armed before any waiting starts.
         quarantined = self._terminalize_room(room, "room-release")
-        stream = self.staging_allocator._scatter_stream
-        if quarantined and stream is not None:
-            stream.synchronize()
+        if quarantined:
+            self._drain_scatter_bounded(room)
 
         chunk_infos = (
             getattr(receiver, "chunk_staging_infos", []) if receiver is not None else []
