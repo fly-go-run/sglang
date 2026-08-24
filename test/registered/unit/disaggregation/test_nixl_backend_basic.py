@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
     PrefillStagingContext,
 )
+from sglang.srt.disaggregation.common.staging_buffer import StagingInvariantCounters
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
@@ -521,7 +522,7 @@ class TestNixlNotifications(CustomTestCase):
         mgr.required_prefill_response_num_table = required or {}
         mgr.enable_staging = False
         mgr._staging_handler = None
-        mgr._chunk_writer_counts = defaultdict(lambda: defaultdict(list))
+        mgr._chunk_writer_counts = defaultdict(lambda: defaultdict(set))
         return mgr
 
     def test_kv_last_notification_sets_expected_count(self):
@@ -534,14 +535,16 @@ class TestNixlNotifications(CustomTestCase):
         self.assertEqual(status.expected_kvs_per_pp[0], 3)
         self.assertEqual(status.num_pp_ranks_expected, 1)
 
-    def test_staging_notification_preserves_agent_name_with_underscores(self):
+    def test_staging_notification_uses_outer_peer_and_engine_rank(self):
         mgr = self._make_manager(["5_stg_0_1_0_2_4_8_agent_with_underscores"])
         calls = []
-        mgr._handle_staging_chunk_arrived = lambda *args: calls.append(args)
+        mgr._handle_staging_chunk_arrived = lambda *args: (
+            calls.append(args) or (True, False)
+        )
 
         mgr.update_transfer_status()
 
-        self.assertEqual(calls, [(5, 2, 4, 8, "agent_with_underscores")])
+        self.assertEqual(calls, [(5, 2, 4, 8, 0, "peer")])
         status = mgr.transfer_statuses[5]
         self.assertEqual(status.received_kvs_per_pp[0], {0})
         self.assertEqual(status.expected_kvs_per_pp[0], 1)
@@ -711,6 +714,9 @@ class TestNixlStaging(CustomTestCase):
             kv_head_num=1,
         )
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
+        mgr._staging_ctx = PrefillStagingContext(
+            invariant_counters=StagingInvariantCounters()
+        )
         return mgr
 
     def test_cancel_pending_xfers_returns_only_handles_that_remain_active(self):
@@ -851,7 +857,7 @@ class TestNixlStaging(CustomTestCase):
                 )
             },
         ):
-            handle, deferred = mgr._do_staging_transfer(
+            handle, deferred, handled = mgr._do_staging_transfer(
                 strategy,
                 kv_chunk,
                 kv_chunk.prefill_kv_indices,
@@ -862,6 +868,7 @@ class TestNixlStaging(CustomTestCase):
 
         self.assertIsNone(handle)
         self.assertTrue(deferred)
+        self.assertFalse(handled)
         self.assertEqual(queue.items, [kv_chunk])
 
     def test_do_staging_transfer_raises_for_oversized_allocation(self):
@@ -938,7 +945,7 @@ class TestNixlStaging(CustomTestCase):
             lambda *args, **kwargs: calls.append((args, kwargs)) or "handle"
         )
 
-        handle, deferred = mgr._do_staging_transfer(
+        handle, deferred, handled = mgr._do_staging_transfer(
             strategy,
             kv_chunk,
             kv_chunk.prefill_kv_indices,
@@ -949,6 +956,7 @@ class TestNixlStaging(CustomTestCase):
 
         self.assertEqual(handle, "handle")
         self.assertFalse(deferred)
+        self.assertTrue(handled)
         self.assertEqual(calls[0][0][8], "3_stg_7_1_1_2_4_2_decode_agent")
 
     def test_send_kvcache_staged_uses_one_bulk_vram_write(self):
