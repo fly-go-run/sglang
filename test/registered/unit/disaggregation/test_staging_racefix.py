@@ -275,6 +275,25 @@ class TestStagingRaceFix(CustomTestCase):
             -1, 1, reason="staging-quarantine"
         )
 
+    def test_scatter_drain_timeout_requests_process_exit(self):
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = SimpleNamespace(
+            _scatter_stream=SimpleNamespace(query=MagicMock(return_value=False))
+        )
+        handler._fatal_shutdown = MagicMock()
+
+        with patch(
+            "sglang.srt.disaggregation.common.staging_handler."
+            "STAGING_SCATTER_DRAIN_TIMEOUT_S",
+            0,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "STAGING_SCATTER_DRAIN_TIMEOUT"):
+                handler._drain_scatter_bounded(12)
+
+        handler._fatal_shutdown.assert_called_once_with(
+            12, 1, reason="staging-scatter-drain-timeout"
+        )
+
 
 if __name__ == "__main__":
     import unittest
