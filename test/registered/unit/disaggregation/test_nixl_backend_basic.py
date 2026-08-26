@@ -490,6 +490,23 @@ class TestNixlTransferWorker(CustomTestCase):
         with self.assertRaises(SystemExit):
             mgr.transfer_worker(queue)
 
+    def test_staging_peer_without_local_strategy_fails_closed(self):
+        room = 20
+        mgr = self._make_manager(room)
+        mgr.enable_staging = True
+        mgr.attn_tp_size = 2
+        mgr.decode_kv_args_table["agent"].staging = SimpleNamespace(
+            base_ptr=0x8000, total_size=4096
+        )
+        mgr.send_kvcache_slice = MagicMock(return_value="slice_handle")
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertIn("STAGING_STRATEGY_MISSING", mgr.failure_records[room])
+        mgr.send_kvcache_slice.assert_not_called()
+
     def test_given_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
     ):
@@ -735,6 +752,53 @@ class TestNixlStaging(CustomTestCase):
             invariant_counters=StagingInvariantCounters()
         )
         return mgr
+
+    def _make_payload_peer(self, staging):
+        return SimpleNamespace(
+            agent_name="decode_agent",
+            decode_tp_size=1,
+            dst_kv_item_lens=[128],
+            dst_kv_mem_kinds=["VRAM"],
+            staging=staging,
+        )
+
+    def test_staging_hetero_peer_skips_direct_slice_prepared_dlist(self):
+        mgr = self._make_manager()
+        mgr.enable_staging = True
+        mgr.src_mem_kind = "VRAM"
+        mgr.kv_args.kv_item_lens = [128]
+        mgr._init_hetero_tp_prep_handle = MagicMock()
+        peer = self._make_payload_peer(
+            SimpleNamespace(base_ptr=0x8000, total_size=4096)
+        )
+
+        mgr._prepare_payload_xfer(peer)
+
+        mgr._init_hetero_tp_prep_handle.assert_not_called()
+
+    def test_hetero_peer_without_negotiated_staging_keeps_direct_slice_prep(self):
+        for enable_staging, staging in (
+            (False, SimpleNamespace(base_ptr=0x8000, total_size=4096)),
+            (True, None),
+        ):
+            with self.subTest(
+                enable_staging=enable_staging, remote_staging=staging is not None
+            ):
+                mgr = self._make_manager()
+                mgr.enable_staging = enable_staging
+                mgr.src_mem_kind = "VRAM"
+                mgr.kv_args.kv_item_lens = [128]
+                mgr._init_hetero_tp_prep_handle = MagicMock()
+                peer = self._make_payload_peer(staging)
+
+                mgr._prepare_payload_xfer(peer)
+
+                mgr._init_hetero_tp_prep_handle.assert_called_once_with(
+                    peer.agent_name,
+                    peer,
+                    src_mem_kind="VRAM",
+                    dst_mem_kind="VRAM",
+                )
 
     def test_cancel_pending_xfers_returns_only_handles_that_remain_active(self):
         agent = MagicMock()

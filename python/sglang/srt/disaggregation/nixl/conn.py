@@ -1000,6 +1000,14 @@ class NixlKVManager(CommonKVManager):
             )
         peer_info.kv_xfer_segments = prepared_segments
 
+    def _is_staging_peer(self, peer_info: KVArgsRegisterInfo) -> bool:
+        return (
+            self.enable_staging
+            and peer_info.staging is not None
+            and not self.is_mla_backend
+            and peer_info.decode_tp_size != self.attn_tp_size
+        )
+
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
@@ -1015,6 +1023,17 @@ class NixlKVManager(CommonKVManager):
                 f"({n_dst}) than prefill ({n_src}); unexpected geometry"
             )
         decode_only_spec_dec = n_dst > n_src
+
+        # Heterogeneous-TP peers with staging support use bulk transfers through
+        # the decode staging buffer. Building the direct-slice destination dlist
+        # here expands every KV slot across every K/V layer even though that
+        # fallback is not used, retaining several GiB per peer generation.
+        if self._is_staging_peer(peer_info):
+            logger.info(
+                "Skipping direct-slice prepared dlist for staging peer %s",
+                peer_info.agent_name,
+            )
+            return
 
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
             dst_mem_kind = None
@@ -1172,15 +1191,15 @@ class NixlKVManager(CommonKVManager):
                         #   1. Staging (heterogeneous TP, both sides have
                         #      registered staging, watermark/alloc ready)
                         #   2. send_kvcache (MLA or homogeneous TP)
-                        #   3. send_kvcache_slice (heterogeneous TP fallback,
-                        #      or staging hard-failed for this chunk)
-                        use_staging = (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and not self.is_mla_backend
-                            and decode_tp_size != self.attn_tp_size
-                            and dst_info.staging is not None
-                        )
+                        #   3. send_kvcache_slice (heterogeneous TP when staging
+                        #      was not negotiated by both sides)
+                        use_staging = self._is_staging_peer(dst_info)
+                        if use_staging and staging_strategy is None:
+                            raise RuntimeError(
+                                "[STAGING_STRATEGY_MISSING] heterogeneous-TP "
+                                f"peer {req.agent_name} registered staging metadata, "
+                                "but no local staging strategy is available"
+                            )
                         if use_staging and self._is_staging_send_done(
                             room, kv_chunk.chunk_id, req.agent_name
                         ):
