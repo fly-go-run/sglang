@@ -614,12 +614,13 @@ class DecodeStagingHandler:
         decode_req._scatter_alloc_id = -1
         decode_req._scatter_chunk_idx = -1
         # Stall clock: None means "no allocations held / progress just made".
-        # It starts counting the first time advance_scatter observes the room
-        # holding staging allocations, and is reset by every progress event
-        # (chunk arrival, scatter submit, event completion). Progress is
+        # It starts counting only after the first accepted writer notification,
+        # and is reset by every later progress event (chunk arrival, scatter
+        # submit, event completion). Progress is
         # recorded by the decode thread while timeout checks run on the
         # scheduler thread, so serialize the timestamp and failure decision.
         decode_req._staging_progress_lock = threading.Lock()
+        decode_req._staging_data_started = False
         decode_req._staging_stall_since = None
         decode_req._staging_stall_failed = False
         self._room_lifecycles[room] = StagingRoomLifecycle()
@@ -922,7 +923,7 @@ class DecodeStagingHandler:
                             writer_counts.add(coverage_key)
                         else:
                             writer_counts.append(coverage_key)
-                        self._note_staging_progress(decode_req)
+                        self._note_staging_data_started(decode_req)
                         coverage_complete = self._chunk_coverage_complete_locked(
                             lifecycle, chunk_idx, num_writers
                         )
@@ -1152,6 +1153,13 @@ class DecodeStagingHandler:
             if not decode_req._staging_stall_failed:
                 decode_req._staging_stall_since = None
 
+    def _note_staging_data_started(self, decode_req: DecodeRequest) -> None:
+        """Mark the first accepted writer and refresh the stall clock atomically."""
+        with decode_req._staging_progress_lock:
+            if not decode_req._staging_stall_failed:
+                decode_req._staging_data_started = True
+                decode_req._staging_stall_since = None
+
     def _check_room_stall(self, room: int, decode_req: DecodeRequest) -> None:
         """Fail a room that holds ring allocations but makes no progress.
 
@@ -1160,13 +1168,16 @@ class DecodeStagingHandler:
         _check_waiting_timeout) routes it into the existing
         Failed -> pop_transferred -> unregister_decode_req -> release_room
         path, which frees its allocations and unpins the shared ring.
-        The clock only runs while allocations are held, so queued rooms that
-        have not engaged staging yet are never failed here.
+        The clock only runs after the first accepted writer and while allocations
+        are held, so allocation-only rooms waiting for data are never failed here.
         """
         receiver = self._room_to_receiver.get(room)
         now = time.monotonic()
         with decode_req._staging_progress_lock:
             if decode_req._staging_stall_failed:
+                return
+            if not decode_req._staging_data_started:
+                decode_req._staging_stall_since = None
                 return
             if not self._room_holds_allocations(decode_req, receiver):
                 decode_req._staging_stall_since = None

@@ -206,6 +206,7 @@ class TestStagingRaceFix(CustomTestCase):
             handler.handle_chunk_arrived(19, 0, 0, 567, 0, "peer", counts),
             (True, False),
         )
+        self.assertTrue(handler._room_to_decode_req[19]._staging_data_started)
         self.assertEqual(
             handler.handle_chunk_arrived(19, 0, 567, 332, 0, "peer", counts),
             (True, True),
