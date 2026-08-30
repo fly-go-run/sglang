@@ -1236,6 +1236,7 @@ class NixlKVManager(CommonKVManager):
                                         room,
                                         worker_idx,
                                         kv_chunk.is_last_chunk,
+                                        staging_transfer=True,
                                     )
                                 except StagingTransferCancelledError:
                                     self._mark_staging_send_failed(
@@ -1373,7 +1374,13 @@ class NixlKVManager(CommonKVManager):
                 self.update_status(room, KVPoll.Failed)
 
     def _wait_for_xfers(
-        self, handles: List[Any], room: int, worker_idx: int, is_last_chunk: bool
+        self,
+        handles: List[Any],
+        room: int,
+        worker_idx: int,
+        is_last_chunk: bool,
+        *,
+        staging_transfer: bool = False,
     ) -> None:
         """Wait for handles to become terminal before their source is reusable."""
         handle_wait_started = time.monotonic()
@@ -1418,6 +1425,22 @@ class NixlKVManager(CommonKVManager):
                         raise RuntimeError(
                             f"NIXL transfer entered ERR for room={room}, but "
                             f"{len(unsafe)} transfers remain unsafe"
+                        )
+                    if staging_transfer:
+                        # The Python NIXL API collapses all terminal backend
+                        # statuses to ERR. For the Prefill staging path, a
+                        # terminal error can mean that the local TX pool or
+                        # the remote Decode RX pool is permanently exhausted.
+                        # Fail-stop this Prefill instead of leaving a worker
+                        # online that may fail every subsequent request.
+                        self._request_fatal_transfer_shutdown(
+                            room,
+                            1,
+                            reason="staging-terminal-error",
+                        )
+                        raise RuntimeError(
+                            f"[STAGING_HANDLE_ERR] room={room} terminal staging "
+                            "transfer error; requesting process-tree shutdown"
                         )
                     raise StagingTransferCancelledError(
                         f"[STAGING_HANDLE_ERR] room={room} transfer failed; "

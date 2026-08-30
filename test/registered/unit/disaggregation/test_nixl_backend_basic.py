@@ -850,6 +850,34 @@ class TestNixlStaging(CustomTestCase):
         agent.release_xfer_handle.assert_called_once_with("handle")
         mgr._request_fatal_transfer_shutdown.assert_not_called()
 
+    def test_terminal_nonstaging_xfer_remains_request_scoped(self):
+        agent = MagicMock()
+        agent.check_xfer_state.return_value = "ERR"
+        mgr = self._make_manager(agent)
+        mgr._request_fatal_transfer_shutdown = MagicMock()
+
+        with self.assertRaisesRegex(
+            StagingTransferCancelledError, "STAGING_HANDLE_ERR"
+        ):
+            mgr._wait_for_xfers(["handle"], 17, 0, False)
+
+        mgr._request_fatal_transfer_shutdown.assert_not_called()
+
+    def test_terminal_staging_xfer_requests_process_tree_shutdown(self):
+        agent = MagicMock()
+        agent.check_xfer_state.return_value = "ERR"
+        mgr = self._make_manager(agent)
+        mgr._request_fatal_transfer_shutdown = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "terminal staging transfer error"):
+            mgr._wait_for_xfers(
+                ["handle"], 17, 0, False, staging_transfer=True
+            )
+
+        mgr._request_fatal_transfer_shutdown.assert_called_once_with(
+            17, 1, reason="staging-terminal-error"
+        )
+
     def test_peer_gone_fails_room_without_process_tree_shutdown(self):
         for error_code in ("NIXL_ERR_REMOTE_DISCONNECT", "NIXL_ERR_NOT_FOUND"):
             with self.subTest(error_code=error_code):
