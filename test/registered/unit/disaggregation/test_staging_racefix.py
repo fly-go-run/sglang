@@ -1,12 +1,13 @@
 """GPU-free tests for staging race-safety invariants."""
 
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
     StagingInvariantCounters,
@@ -18,7 +19,13 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+    NixlKVSender,
+    TransferInfo,
+    _StagingSenderRoomState,
+)
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -143,6 +150,168 @@ class TestStagingRaceFix(CustomTestCase):
         self.assertEqual(second, (None, False, True))
         mgr.send_kvcache_staged.assert_called_once()
         self.assertEqual(mgr._staging_ctx.invariant_counters.get("duplicate_post"), 0)
+
+    def test_deferred_early_chunk_fences_last_chunk_room_completion(self):
+        room = 41
+        mgr = object.__new__(NixlKVManager)
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.enable_staging = True
+        mgr.kv_buffer_tensors = object()
+        mgr.attn_tp_size = 2
+        mgr.is_mla_backend = False
+        mgr.kv_args = SimpleNamespace(engine_rank=0)
+        mgr.request_status = {room: KVPoll.WaitingForInput}
+        mgr.req_to_decode_prefix_len = {room: 0}
+        mgr._sender_room_lock = threading.RLock()
+        mgr._staging_sender_rooms = {}
+        mgr._staging_ctx = PrefillStagingContext(
+            invariant_counters=StagingInvariantCounters()
+        )
+        mgr.exceptions = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+
+        def make_req(agent_name):
+            return TransferInfo(
+                room=room,
+                endpoint="127.0.0.1",
+                dst_port=9000,
+                agent_name=agent_name,
+                dst_kv_indices=np.array([10, 11], dtype=np.int32),
+                dst_aux_index=0,
+                required_dst_info_num=2,
+                dst_state_indices=[],
+            )
+
+        mgr.transfer_infos = {
+            room: {agent: make_req(agent) for agent in ("decode-a", "decode-b")}
+        }
+        mgr.decode_kv_args_table = {
+            agent: SimpleNamespace(
+                decode_tp_size=1,
+                staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
+                dst_aux_ptrs=[0],
+            )
+            for agent in ("decode-a", "decode-b")
+        }
+        mgr._prefetch_staging_reqs = MagicMock()
+        mgr._try_create_staging_strategy = MagicMock(return_value=object())
+        mgr._wait_for_xfers = MagicMock()
+        mgr.send_aux = MagicMock(return_value="aux-handle")
+
+        class RaceQueue:
+            def __init__(self):
+                self.items = deque()
+                self.get_count = 0
+
+            def put(self, item):
+                self.items.append(item)
+
+            def get(self):
+                if self.get_count == 2:
+                    state = mgr._staging_sender_rooms[room]
+                    self_case.assertEqual(state.registered_chunks, {0, 1})
+                    self_case.assertEqual(state.completed_chunks, {1})
+                    self_case.assertEqual(state.last_chunk_id, 1)
+                    self_case.assertNotEqual(mgr.request_status[room], KVPoll.Success)
+                    self_case.assertIn(room, mgr.transfer_infos)
+                self.get_count += 1
+                if not self.items:
+                    raise SystemExit()
+                return self.items.popleft()
+
+        self_case = self
+        queue = RaceQueue()
+        mgr.transfer_queues = [queue]
+        attempts = defaultdict(int)
+
+        def do_staging(_strategy, chunk, _indices, req, _dst, worker_queue):
+            key = (chunk.chunk_id, req.agent_name)
+            attempts[key] += 1
+            if key == (0, "decode-a") and attempts[key] == 1:
+                worker_queue.put(chunk)
+                return (None, True, False)
+            return (None, False, True)
+
+        mgr._do_staging_transfer = MagicMock(side_effect=do_staging)
+        mgr.add_transfer_request(
+            room,
+            np.array([1], dtype=np.int32),
+            slice(0, 1),
+            False,
+            0,
+        )
+        mgr.add_transfer_request(
+            room,
+            np.array([2], dtype=np.int32),
+            slice(1, 2),
+            True,
+            1,
+            aux_index=0,
+        )
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue, staging_buffer=object(), worker_idx=0)
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Success)
+        self.assertNotIn(room, mgr.transfer_infos)
+        self.assertNotIn(room, mgr.req_to_decode_prefix_len)
+        self.assertNotIn(room, mgr._staging_sender_rooms)
+        self.assertEqual(attempts[(0, "decode-a")], 2)
+        self.assertEqual(attempts[(0, "decode-b")], 1)
+        self.assertEqual(attempts[(1, "decode-a")], 1)
+        self.assertEqual(attempts[(1, "decode-b")], 1)
+
+    def test_staging_sender_duplicate_completion_and_abort_are_terminal(self):
+        room = 43
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_staging = True
+        mgr._sender_room_lock = threading.RLock()
+        mgr._staging_sender_rooms = {
+            room: _StagingSenderRoomState(registered_chunks={0, 1}, last_chunk_id=1)
+        }
+        mgr.request_status = {room: KVPoll.Transferring}
+        mgr.transfer_infos = {room: {"decode": object()}}
+        mgr.req_to_decode_prefix_len = {room: 0}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+
+        self.assertFalse(mgr._finish_staging_sender_chunk(room, 1))
+        self.assertFalse(mgr._finish_staging_sender_chunk(room, 1))
+        self.assertEqual(mgr._staging_sender_rooms[room].completed_chunks, {1})
+
+        self.assertTrue(mgr._handle_abort_notification([b"ABORT", b"43"]))
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertNotIn(room, mgr._staging_sender_rooms)
+        self.assertFalse(mgr._finish_staging_sender_chunk(room, 0))
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+
+    def test_clear_then_late_completion_does_not_revive_room(self):
+        room = 44
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_staging = True
+        mgr._sender_room_lock = threading.RLock()
+        mgr._staging_sender_rooms = {
+            room: _StagingSenderRoomState(
+                registered_chunks={0, 1}, completed_chunks={1}, last_chunk_id=1
+            )
+        }
+        mgr.request_status = {room: KVPoll.Transferring}
+        mgr.transfer_infos = {room: {"decode": object()}}
+        mgr.req_to_decode_prefix_len = {room: 0}
+        mgr._staging_ctx = PrefillStagingContext(
+            invariant_counters=StagingInvariantCounters()
+        )
+        sender = object.__new__(NixlKVSender)
+        sender.bootstrap_room = room
+        sender.kv_mgr = mgr
+
+        sender.clear()
+        self.assertFalse(mgr._finish_staging_sender_chunk(room, 0))
+
+        self.assertNotIn(room, mgr.request_status)
+        self.assertNotIn(room, mgr._staging_sender_rooms)
 
     def test_writer_slot_dedup_and_scatter_once_claim(self):
         handler = object.__new__(DecodeStagingHandler)

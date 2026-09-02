@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.nixl.conn import NixlKVSender
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -21,10 +21,14 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         staging_ctx = SimpleNamespace(
             prefetched_rooms={room, 8},
             prefetch_requested={(room, 0, "session-a"), (8, 0, "session-b")},
+            send_ops={(room, 0, "session-a"): object()},
+            send_ops_lock=threading.Lock(),
         )
-        sender.kv_mgr = SimpleNamespace(
+        sender.kv_mgr = mgr = SimpleNamespace(
             enable_staging=True,
             _staging_ctx=staging_ctx,
+            _sender_room_lock=threading.RLock(),
+            _staging_sender_rooms={room: object()},
             request_status={room: object()},
             req_to_decode_prefix_len={room: 3},
             transfer_infos={room: object()},
@@ -32,6 +36,10 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
             failure_records={room: "transfer failed"},
             failure_lock=threading.Lock(),
         )
+        mgr._clear_staging_sender_room = (
+            NixlKVManager._clear_staging_sender_room.__get__(mgr)
+        )
+        mgr._clear_staging_send_ops = NixlKVManager._clear_staging_send_ops.__get__(mgr)
 
         with self.assertRaises(RuntimeError) as cm:
             sender.failure_exception()
@@ -44,10 +52,12 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         self.assertNotIn(room, sender.kv_mgr.transfer_infos)
         self.assertNotIn(room, sender.kv_mgr.exceptions)
         self.assertNotIn(room, sender.kv_mgr.failure_records)
+        self.assertNotIn(room, sender.kv_mgr._staging_sender_rooms)
         self.assertNotIn(room, staging_ctx.prefetched_rooms)
         self.assertNotIn((room, 0, "session-a"), staging_ctx.prefetch_requested)
         self.assertIn(8, staging_ctx.prefetched_rooms)
         self.assertIn((8, 0, "session-b"), staging_ctx.prefetch_requested)
+        self.assertFalse(staging_ctx.send_ops)
 
 
 if __name__ == "__main__":

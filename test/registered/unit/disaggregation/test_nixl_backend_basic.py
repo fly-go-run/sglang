@@ -344,6 +344,9 @@ class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
         mgr = object.__new__(NixlKVManager)
         mgr.request_status = dict(request_status or {})
+        mgr.enable_staging = False
+        mgr._sender_room_lock = threading.RLock()
+        mgr._staging_sender_rooms = {}
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -460,6 +463,8 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.req_to_decode_prefix_len = {room: 4}
         mgr.enable_staging = False
         mgr._staging_ctx = None
+        mgr._sender_room_lock = threading.RLock()
+        mgr._staging_sender_rooms = {}
         mgr.is_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.kv_args = SimpleNamespace(engine_rank=0)

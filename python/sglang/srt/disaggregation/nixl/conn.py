@@ -396,6 +396,15 @@ class TransferStatus:
         return True
 
 
+@dataclasses.dataclass
+class _StagingSenderRoomState:
+    """Prefill-side completion fence for one staging room."""
+
+    registered_chunks: Set[int] = dataclasses.field(default_factory=set)
+    completed_chunks: Set[int] = dataclasses.field(default_factory=set)
+    last_chunk_id: Optional[int] = None
+
+
 class NixlKVManager(CommonKVManager):
     def __init__(
         self,
@@ -469,6 +478,12 @@ class NixlKVManager(CommonKVManager):
         self.kv_buffer_tensors = None
         self._staging_ctx = None
         self._staging_handler = None
+        # add_transfer_request() runs on the scheduler thread while
+        # transfer_worker(), abort handling, and sender.clear() can retire the
+        # same room concurrently. Keep the staging completion fence and the
+        # room dictionaries under one small, NIXL-local lock.
+        self._sender_room_lock = threading.RLock()
+        self._staging_sender_rooms: Dict[int, _StagingSenderRoomState] = {}
         self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(set))
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
@@ -726,6 +741,46 @@ class NixlKVManager(CommonKVManager):
         if self.request_status.get(bootstrap_room) == KVPoll.Failed:
             return
         super().update_status(bootstrap_room, status)
+
+    def _register_staging_sender_chunk(
+        self, room: int, chunk_id: int, is_last_chunk: bool
+    ) -> None:
+        """Register a staging chunk before making it visible to a worker."""
+        with self._sender_room_lock:
+            state = self._staging_sender_rooms.setdefault(
+                room, _StagingSenderRoomState()
+            )
+            if is_last_chunk:
+                state.last_chunk_id = chunk_id
+            state.registered_chunks.add(chunk_id)
+
+    def _finish_staging_sender_chunk(self, room: int, chunk_id: int) -> bool:
+        """Return true only when every registered chunk has finished."""
+        with self._sender_room_lock:
+            state = self._staging_sender_rooms.get(room)
+            if state is None:
+                return False
+            status = self.request_status.get(room)
+            if status is None or status == KVPoll.Failed:
+                self._staging_sender_rooms.pop(room, None)
+                return False
+            state.completed_chunks.add(chunk_id)
+            # add_transfer_request() registers on the scheduler thread before
+            # queue.put(); workers therefore only complete registered ids.
+            if state.last_chunk_id is None or not state.registered_chunks.issubset(
+                state.completed_chunks
+            ):
+                self.update_status(room, KVPoll.Transferring)
+                return False
+            self.update_status(room, KVPoll.Success)
+            self.transfer_infos.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+            self._staging_sender_rooms.pop(room, None)
+            return True
+
+    def _clear_staging_sender_room(self, room: int) -> None:
+        with self._sender_room_lock:
+            self._staging_sender_rooms.pop(room, None)
 
     def _prep_equal_tp_dlist(
         self,
@@ -1346,18 +1401,28 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                if self.enable_staging:
+                    staging_room_done = self._finish_staging_sender_chunk(
+                        room, kv_chunk.chunk_id
+                    )
+                    if not staging_room_done:
+                        continue
+                    # _finish_staging_sender_chunk() performs the status and
+                    # room-dictionary transition atomically. Only NIXL staging
+                    # metadata remains to be discarded here.
+                    if self._staging_ctx is not None:
+                        self._staging_ctx.prefetched_rooms.discard(room)
+                        for key in list(self._staging_ctx.prefetch_requested):
+                            if key[0] == room:
+                                self._staging_ctx.prefetch_requested.discard(key)
+                        self._clear_staging_send_ops(room)
+                    continue
+
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
+                    # Drop per-room state on Success (parity with mooncake).
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        for k in list(self._staging_ctx.prefetch_requested):
-                            if k[0] == room:
-                                self._staging_ctx.prefetch_requested.discard(k)
-                        self._clear_staging_send_ops(room)
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
@@ -1372,6 +1437,8 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+                if self.enable_staging:
+                    self._clear_staging_sender_room(room)
 
     def _wait_for_xfers(
         self,
@@ -2698,6 +2765,8 @@ class NixlKVManager(CommonKVManager):
         # in this room needs heterogeneous-TP staging.
         if self.enable_staging:
             self._prefetch_staging_reqs(bootstrap_room)
+            # Publish completion metadata before queue.put() wakes the worker.
+            self._register_staging_sender_chunk(bootstrap_room, chunk_id, is_last_chunk)
 
         # Transfer is async: just enqueue the chunk; the per-queue worker
         # (transfer_worker) does the actual gather + RDMA. Routing by
@@ -2936,15 +3005,21 @@ class NixlKVManager(CommonKVManager):
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
 
-        if (
-            room_to_be_aborted in self.request_status
-            and self.check_status(room_to_be_aborted) != KVPoll.Success
-        ):
-            self.record_failure(
-                room_to_be_aborted,
-                "Aborted by decode-side abort notification.",
-            )
-            self.update_status(room_to_be_aborted, KVPoll.Failed)
+        marked_failed = False
+        with self._sender_room_lock:
+            if (
+                room_to_be_aborted in self.request_status
+                and self.check_status(room_to_be_aborted) != KVPoll.Success
+            ):
+                self.record_failure(
+                    room_to_be_aborted,
+                    "Aborted by decode-side abort notification.",
+                )
+                self.update_status(room_to_be_aborted, KVPoll.Failed)
+                if self.enable_staging:
+                    self._clear_staging_sender_room(room_to_be_aborted)
+                marked_failed = True
+        if marked_failed:
             logger.debug(
                 f"Received abort notification for room {room_to_be_aborted}, "
                 f"marked as Failed"
@@ -3103,11 +3178,14 @@ class NixlKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
-        super().clear()
-        if (
-            getattr(self.kv_mgr, "enable_staging", False)
-            and getattr(self.kv_mgr, "_staging_ctx", None) is not None
-        ):
+        with self.kv_mgr._sender_room_lock:
+            # CommonKVSender.clear() removes request_status/transfer_infos.
+            # Holding the same lock as worker completion makes that removal a
+            # terminal action rather than a window in which a late completion
+            # can publish Success again.
+            super().clear()
+            self.kv_mgr._staging_sender_rooms.pop(self.bootstrap_room, None)
+        if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
             self.kv_mgr._staging_ctx.prefetch_requested = {
                 key
