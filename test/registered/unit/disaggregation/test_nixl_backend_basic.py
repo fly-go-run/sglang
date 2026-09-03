@@ -1317,7 +1317,7 @@ class TestDecodeStagingStallGuard(CustomTestCase):
         decode_req._staging_all_success = True
         decode_req._staging_stall_since = 0.0
         handler._room_lifecycles[17].chunk_states[0] = "SCATTER_SUBMITTED"
-        handler._free_and_send_watermark = MagicMock()
+        handler._free_allocation = MagicMock()
         return handler, receiver, decode_req, event
 
     def test_completed_last_scatter_is_consumed_before_stall_check(self):
@@ -1334,7 +1334,7 @@ class TestDecodeStagingStallGuard(CustomTestCase):
         self.assertTrue(decode_req._staging_scatter_done)
         self.assertEqual(decode_req._chunk_events, [])
         self.assertEqual(receiver.chunk_staging_infos[-1], (-1, -1, 0, -1, 0))
-        handler._free_and_send_watermark.assert_called_once_with(41, decode_req)
+        handler._free_allocation.assert_called_once_with(41, decode_req)
         handler.kv_manager.record_failure.assert_not_called()
 
     def test_allocation_only_does_not_start_staging_stall(self):

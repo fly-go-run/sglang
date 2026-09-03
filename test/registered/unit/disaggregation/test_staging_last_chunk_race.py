@@ -76,7 +76,7 @@ def _make_handler(geometry, chunk_infos, num_writers=1):
     handler._room_to_receiver = {ROOM: receiver}
     handler._room_lifecycles = {ROOM: lifecycle}
     handler._scatter_region = MagicMock(return_value=True)
-    handler._free_and_send_watermark = MagicMock()
+    handler._free_allocation = MagicMock()
     handler.fail_staging_room = MagicMock()
     return handler, decode_req, receiver, lifecycle
 
@@ -124,7 +124,7 @@ class TestStagingArrivalDrivenCompletion(CustomTestCase):
                 handler.advance_scatter(decode_req)
                 self.assertEqual(lifecycle.chunk_states[0], "SCATTER_DONE")
                 self.assertEqual(receiver.chunk_staging_infos[0], (-1, -1, 0, -1, 0))
-                handler._free_and_send_watermark.assert_called_once_with(11, decode_req)
+                handler._free_allocation.assert_called_once_with(11, decode_req)
                 self.assertTrue(decode_req._staging_scatter_done)
                 self.assertTrue(handler.is_done(decode_req))
                 self.assertFalse(decode_req._staging_stall_failed)
@@ -166,7 +166,7 @@ class TestStagingArrivalDrivenCompletion(CustomTestCase):
             self.assertTrue(handler.submit_chunk_scatter(ROOM, 0, 0, 4))
         handler.advance_scatter(decode_req)
         self.assertTrue(handler.is_done(decode_req))
-        self.assertEqual(handler._free_and_send_watermark.call_count, 2)
+        self.assertEqual(handler._free_allocation.call_count, 2)
         self.assertTrue(all(info[0] < 0 for info in receiver.chunk_staging_infos))
 
     def test_pending_event_keeps_room_open(self):
@@ -217,7 +217,7 @@ class TestStagingArrivalDrivenCompletion(CustomTestCase):
         handler.release_unwritten_chunks(ROOM)
         self.assertEqual(receiver.chunk_staging_infos[0], (-1, -1, 0, -1, 0))
         self.assertEqual(lifecycle.chunk_states[0], "SCATTER_DONE")
-        handler._free_and_send_watermark.assert_called_once_with(11, decode_req)
+        handler._free_allocation.assert_called_once_with(11, decode_req)
         handler.submit_last_scatter_async(ROOM)
         handler.advance_scatter(decode_req)
         self.assertTrue(handler.is_done(decode_req))

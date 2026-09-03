@@ -36,17 +36,13 @@ def _cpu_allocator(size=128):
     allocator = object.__new__(StagingAllocator)
     allocator.total_size = size
     allocator.base_ptr = 0x1000
-    allocator.head = 0
-    allocator.round = 0
+    allocator.free_extents = [(0, size)]
     allocator.allocations = {}
-    allocator.alloc_order = []
     allocator.quarantined_allocations = set()
     allocator.quarantine_count = 0
     allocator.invariant_counters = StagingInvariantCounters()
     allocator._quarantine_callback = None
     allocator.next_alloc_id = 0
-    allocator.watermark_round = 0
-    allocator.watermark_tail = 0
     allocator.lock = threading.Lock()
     allocator._scatter_stream = None
     return allocator
@@ -90,7 +86,7 @@ class TestStagingRaceFix(CustomTestCase):
         handler._room_to_receiver = {19: receiver}
         handler._room_lifecycles = {19: lifecycle}
         handler._scatter_region = MagicMock(return_value=True)
-        handler._free_and_send_watermark = MagicMock()
+        handler._free_allocation = MagicMock()
         handler.fail_staging_room = MagicMock()
         counts = defaultdict(lambda: defaultdict(set))
         return handler, lifecycle, counts
@@ -431,7 +427,7 @@ class TestStagingRaceFix(CustomTestCase):
         self.assertFalse(lifecycle.terminal)
         handler.fail_staging_room.assert_not_called()
         handler._scatter_region.assert_not_called()
-        handler._free_and_send_watermark.assert_not_called()
+        handler._free_allocation.assert_not_called()
 
     def test_terminal_last_scatter_does_not_dereference_cleared_receiver(self):
         handler, lifecycle, _counts = self._make_coverage_handler()

@@ -9,6 +9,7 @@ protocol code is at the bottom.
 from __future__ import annotations
 
 import dataclasses
+from collections import deque
 import logging
 import os
 import random
@@ -30,10 +31,6 @@ STAGING_WATERMARK_WAIT_S = 0.001
 # thread. A dead or backpressured prefill peer can otherwise freeze decode and
 # every connected prefill group. The sender below coalesces each subscriber to
 # its newest watermark and retries outside the scheduler thread.
-STAGING_WATERMARK_SEND_RETRY_S = 0.001
-STAGING_WATERMARK_SEND_WARN_AFTER_S = 5.0
-STAGING_WATERMARK_SEND_WARN_EVERY_S = 30.0
-STAGING_WATERMARK_SEND_ERROR_EVERY_S = 30.0
 
 # The staging ring is shared by every prefill session: one room that holds
 # allocations without making scatter progress pins the global watermark and
@@ -157,236 +154,101 @@ class DecodeStagingHandler:
         self._quarantine_exit_timer = None
         self.staging_allocator.set_quarantine_callback(self._on_quarantine)
         self.staging_allocator._staging_handler = self
-        self._wm_subscribers: dict = {}
-        self._wm_next_generation = 0
-        self._wm_send_cv = threading.Condition()
-        self._wm_send_pending: dict = {}
-        self._wm_send_wait_started: dict = {}
-        self._wm_send_last_log: dict = {}
-        self._wm_send_error_last_log: dict = {}
-        threading.Thread(
-            target=self._watermark_sender_loop,
-            daemon=True,
-            name="staging-watermark-sender",
-        ).start()
+        # STAGING_REQs that found no free extent wait here in FIFO order and
+        # are granted (and answered with STAGING_RSP) as releases free space.
+        # This is the staging layer's admission control; no watermark exists.
+        self._pending_allocs: deque = deque()
+        self._pending_lock = threading.Lock()
 
+    # Watermark subscriptions no longer exist: a granted extent is exclusive
+    # until released, so prefill never waits on decode. Kept as no-ops for the
+    # shared call sites in the NIXL/Mooncake managers.
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
-        """Register or refresh a prefill watermark subscriber.
-
-        A new session on the same endpoints bumps the generation. Sender work
-        captured for the old generation is then discarded instead of being
-        requeued onto the replacement receiver.
-        """
-        if receiver is None or not getattr(receiver, "bootstrap_infos", None):
-            return
-        key = tuple(str(bi) for bi in receiver.bootstrap_infos)
-        with self._wm_send_cv:
-            previous = self._wm_subscribers.get(key)
-            if previous is None or previous[1] != session_id:
-                self._wm_next_generation += 1
-                generation = self._wm_next_generation
-                self._wm_subscribers[key] = (receiver, session_id, generation)
-                wm_round, wm_tail = self.staging_allocator.get_watermark()
-                self._wm_send_pending[key] = (
-                    receiver,
-                    session_id,
-                    wm_round,
-                    wm_tail,
-                    generation,
-                )
-                logger.info(
-                    "STAGING_WATERMARK_SUBSCRIBER_REGISTER subscriber=%s "
-                    "session=%s generation=%s replaced=%s",
-                    key,
-                    session_id,
-                    generation,
-                    previous is not None,
-                )
-            else:
-                # A receiver is request-scoped in this integration. Refresh it
-                # without bumping generation when the peer session is unchanged.
-                generation = previous[2]
-                self._wm_subscribers[key] = (receiver, session_id, generation)
-                pending = self._wm_send_pending.get(key)
-                if pending is not None and pending[4] == generation:
-                    self._wm_send_pending[key] = (
-                        receiver,
-                        session_id,
-                        pending[2],
-                        pending[3],
-                        generation,
-                    )
-            self._wm_send_cv.notify()
+        return None
 
     def snapshot_wm_subscribers(self, bootstrap_info_groups) -> list:
-        """Capture generation-guarded subscriber tokens for node cleanup."""
-        keys = {
-            tuple(str(bootstrap_info) for bootstrap_info in bootstrap_infos)
-            for bootstrap_infos in bootstrap_info_groups
-            if bootstrap_infos
-        }
-        with self._wm_send_cv:
-            return [
-                (key, self._wm_subscribers[key][2])
-                for key in keys
-                if key in self._wm_subscribers
-            ]
+        return []
 
     def unregister_wm_subscribers(self, subscriber_tokens, reason: str) -> None:
-        """Remove only subscribers whose captured generation is still active."""
-        removed = []
-        with self._wm_send_cv:
-            for key, generation in subscriber_tokens:
-                active = self._wm_subscribers.get(key)
-                if active is None or active[2] != generation:
-                    continue
-                self._wm_subscribers.pop(key, None)
-                pending = self._wm_send_pending.get(key)
-                if pending is not None and pending[4] == generation:
-                    self._wm_send_pending.pop(key, None)
-                token = (key, generation)
-                self._wm_send_wait_started.pop(token, None)
-                self._wm_send_last_log.pop(token, None)
-                self._wm_send_error_last_log.pop(token, None)
-                removed.append((key, active[1], generation))
-            self._wm_send_cv.notify()
-        for key, session_id, generation in removed:
-            logger.info(
-                "STAGING_WATERMARK_SUBSCRIBER_REMOVE subscriber=%s "
-                "session=%s generation=%s reason=%s",
-                key,
-                session_id,
-                generation,
-                reason,
+        return None
+
+    # ------------------------------------------------------------------
+    # Pending allocations: FIFO admission for STAGING_REQs that found no extent
+    # ------------------------------------------------------------------
+
+    def enqueue_pending_alloc(
+        self, room: int, chunk_idx: int, required: int, session_id: str, pages: int
+    ) -> None:
+        with self._pending_lock:
+            for item in self._pending_allocs:
+                if item[0] == room and item[1] == chunk_idx:
+                    return
+            self._pending_allocs.append((room, chunk_idx, required, session_id, pages))
+            logger.warning(
+                "[STAGING_ALLOC_PENDING] room=%s chunk=%s bytes=%s queued=%s "
+                "free=%s largest=%s",
+                room,
+                chunk_idx,
+                required,
+                len(self._pending_allocs),
+                self.staging_allocator.free_bytes(),
+                self.staging_allocator.largest_extent(),
             )
 
-    def _queue_watermark_broadcast(self, wm_round: int, wm_tail: int) -> None:
-        """Queue only the newest watermark for every known prefill peer."""
-        with self._wm_send_cv:
-            for key, (
-                receiver,
-                session_id,
-                generation,
-            ) in self._wm_subscribers.items():
-                self._wm_send_pending[key] = (
-                    receiver,
-                    session_id,
-                    wm_round,
-                    wm_tail,
-                    generation,
-                )
-            self._wm_send_cv.notify()
+    def drop_pending_allocs(self, room: int) -> None:
+        with self._pending_lock:
+            kept = [item for item in self._pending_allocs if item[0] != room]
+            if len(kept) != len(self._pending_allocs):
+                self._pending_allocs = deque(kept)
 
-    def _requeue_watermark(self, key, item) -> bool:
-        """Retry a failed send without replacing a newer queued watermark."""
-        with self._wm_send_cv:
-            active = self._wm_subscribers.get(key)
-            generation = item[4]
-            if active is None or active[2] != generation:
-                return False
-            retry_item = (active[0], active[1], item[2], item[3], generation)
-            current = self._wm_send_pending.get(key)
-            if (
-                current is None
-                or current[4] != generation
-                or (current[2], current[3]) < (item[2], item[3])
-            ):
-                self._wm_send_pending[key] = retry_item
-            self._wm_send_cv.notify()
-            return True
+    def pending_alloc_count(self) -> int:
+        with self._pending_lock:
+            return len(self._pending_allocs)
 
-    def _watermark_sender_loop(self) -> None:
-        """Send watermarks off-thread without blocking on ZMQ backpressure."""
-        import zmq
+    def _service_pending_allocs(self) -> None:
+        """Grant queued STAGING_REQs in FIFO order while extents fit.
 
+        Stops at the first request that still does not fit so a large chunk is
+        never starved by smaller ones queued behind it.
+        """
         while True:
-            with self._wm_send_cv:
-                while not self._wm_send_pending:
-                    self._wm_send_cv.wait()
-                pending = list(self._wm_send_pending.items())
-                self._wm_send_pending.clear()
-
-            retry_needed = False
-            for key, item in pending:
-                receiver, session_id, wm_round, wm_tail, generation = item
-                with self._wm_send_cv:
-                    active = self._wm_subscribers.get(key)
-                    if active is None or active[2] != generation:
-                        continue
-                    # Use the freshest request-scoped receiver for this peer.
-                    receiver, session_id, generation = active
-                token = (key, generation)
-                message = [
-                    b"WATERMARK",
-                    str(wm_round).encode("ascii"),
-                    str(wm_tail).encode("ascii"),
-                    session_id.encode("ascii"),
-                ]
-                delivered = True
-                for bootstrap_info in receiver.bootstrap_infos:
-                    lock = None
-                    acquired = False
-                    try:
-                        sock, lock = receiver._connect_to_bootstrap_server(
-                            bootstrap_info
-                        )
-                        acquired = lock.acquire(timeout=0.01)
-                        if not acquired:
-                            delivered = False
-                            continue
-                        sock.send_multipart(message, flags=zmq.NOBLOCK)
-                    except zmq.Again:
-                        delivered = False
-                    except Exception:
-                        delivered = False
-                        now = time.monotonic()
-                        last_error_log = self._wm_send_error_last_log.get(token, 0.0)
-                        if now - last_error_log >= STAGING_WATERMARK_SEND_ERROR_EVERY_S:
-                            logger.exception(
-                                "STAGING_WATERMARK_SEND_ERROR subscriber=%s "
-                                "session=%s generation=%s watermark=(%s,%s)",
-                                key,
-                                session_id,
-                                generation,
-                                wm_round,
-                                wm_tail,
-                            )
-                            self._wm_send_error_last_log[token] = now
-                    finally:
-                        if acquired and lock is not None:
-                            lock.release()
-
-                if delivered:
-                    self._wm_send_wait_started.pop(token, None)
-                    self._wm_send_last_log.pop(token, None)
-                    self._wm_send_error_last_log.pop(token, None)
+            with self._pending_lock:
+                if not self._pending_allocs:
+                    return
+                room, chunk_idx, required, session_id, pages = self._pending_allocs[0]
+                lifecycle = self._room_lifecycles.get(room)
+                receiver = self._room_to_receiver.get(room)
+                if lifecycle is None or receiver is None or lifecycle.terminal:
+                    self._pending_allocs.popleft()
                     continue
-
-                if not self._requeue_watermark(key, item):
-                    continue
-                retry_needed = True
-                now = time.monotonic()
-                started = self._wm_send_wait_started.setdefault(token, now)
-                last_log = self._wm_send_last_log.get(token, 0.0)
-                if (
-                    now - started >= STAGING_WATERMARK_SEND_WARN_AFTER_S
-                    and now - last_log >= STAGING_WATERMARK_SEND_WARN_EVERY_S
-                ):
-                    logger.warning(
-                        "STAGING_WATERMARK_SEND_BLOCKED subscriber=%s "
-                        "session=%s generation=%s watermark=(%s,%s) waited=%.1fs; "
-                        "coalescing and retrying off scheduler thread",
-                        key,
-                        session_id,
-                        generation,
-                        wm_round,
-                        wm_tail,
-                        now - started,
-                    )
-                    self._wm_send_last_log[token] = now
-
-            if retry_needed:
-                time.sleep(STAGING_WATERMARK_SEND_RETRY_S)
+                result = self.staging_allocator.assign(required)
+                if result is None:
+                    return
+                self._pending_allocs.popleft()
+            alloc_id, offset, _ = result
+            granted = False
+            with lifecycle.lock:
+                infos = getattr(receiver, "chunk_staging_infos", [])
+                state = lifecycle.chunk_states.get(chunk_idx)
+                if not lifecycle.terminal and state == "PENDING_ALLOC":
+                    while len(infos) <= chunk_idx:
+                        infos.append((-1, -1, 0, -1, 0))
+                    infos[chunk_idx] = (alloc_id, offset, 0, offset + required, pages)
+                    lifecycle.chunk_states[chunk_idx] = "WRITABLE"
+                    granted = True
+            if not granted:
+                self.staging_allocator.free(alloc_id)
+                continue
+            send_staging_rsp(
+                receiver,
+                self.kv_manager._staging_ctx.room_bootstrap,
+                room,
+                chunk_idx,
+                offset,
+                0,
+                offset + required,
+                session_id,
+            )
 
     def num_writers_for(self, decode_req) -> int:
         """Compute num_writers for a specific request based on its prefill TP."""
@@ -582,6 +444,7 @@ class DecodeStagingHandler:
         receiver = self._room_to_receiver.get(room)
         if lifecycle is None or decode_req is None:
             return set()
+        self.drop_pending_allocs(room)
         with lifecycle.lock:
             lifecycle.terminal = True
             alloc_ids = self._outstanding_alloc_ids(decode_req, receiver)
@@ -672,6 +535,7 @@ class DecodeStagingHandler:
     def unregister_decode_req(self, room: int) -> None:
         # The lifecycle terminal flag closes new work before the maps disappear.
         # This lets release_room still discover and quarantine every live alloc.
+        self.drop_pending_allocs(room)
         decode_req = self._room_to_decode_req.get(room)
         receiver = self._room_to_receiver.get(room)
         if decode_req is not None:
@@ -1017,7 +881,7 @@ class DecodeStagingHandler:
                     continue
                 lifecycle.chunk_states[chunk_idx] = "SCATTER_DONE"
                 chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
-                self._free_and_send_watermark(alloc_id, decode_req)
+                self._free_allocation(alloc_id, decode_req)
 
     # ------------------------------------------------------------------
     # Event check + free: called from main thread (pop_transferred)
@@ -1059,7 +923,7 @@ class DecodeStagingHandler:
                         ):
                             chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
                         if not lifecycle.terminal:
-                            self._free_and_send_watermark(alloc_id, decode_req)
+                            self._free_allocation(alloc_id, decode_req)
 
         # Resource-driven completion (same model as upstream #30545): all
         # ranks reported Success, every scatter event fired, and no staging
@@ -1268,14 +1132,11 @@ class DecodeStagingHandler:
         if receiver is not None:
             receiver.conclude_state = KVPoll.Failed
 
-    def _free_and_send_watermark(
-        self, alloc_id: int, decode_req: DecodeRequest
-    ) -> None:
-        """Free a staging allocation and asynchronously broadcast its watermark."""
+    def _free_allocation(self, alloc_id: int, decode_req: DecodeRequest) -> None:
+        """Release an extent and grant queued STAGING_REQs that now fit."""
         if not self.staging_allocator.free(alloc_id):
             return
-        wm_round, wm_tail = self.staging_allocator.get_watermark()
-        self._queue_watermark_broadcast(wm_round, wm_tail)
+        self._service_pending_allocs()
 
 
 def is_watermark_ready(
@@ -1627,6 +1488,7 @@ def handle_staging_req(
 
     expected_geometry = (chunk_idx * full_chunk_pages, chunk_num_pages)
     violation = None
+    pending = False
     with lifecycle.lock:
         state = lifecycle.chunk_states.get(chunk_idx)
         if lifecycle.terminal or state in (
@@ -1665,14 +1527,17 @@ def handle_staging_req(
         ):
             offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
             lifecycle.chunk_states.setdefault(chunk_idx, "OVERSIZED")
+        elif violation is None and state == "PENDING_ALLOC":
+            # Another prefill rank asked for the same chunk while it is still
+            # queued for an extent; the grant will answer every rank at once.
+            return
         elif violation is None:
-            result = staging_allocator.assign(required)
             while len(infos) <= chunk_idx:
                 infos.append((-1, -1, 0, -1, 0))
-            if result is None:
+            if required > staging_allocator.total_size:
                 logger.error(
-                    "[STAGING_REQ] alloc failed room=%s chunk=%d (need %d bytes, "
-                    "buffer total=%d bytes). Increase "
+                    "[STAGING_REQ] chunk exceeds the staging pool room=%s chunk=%d "
+                    "(need %d bytes, pool total=%d bytes). Increase "
                     "SGLANG_DISAGG_STAGING_POOL_SIZE_MB.",
                     room,
                     chunk_idx,
@@ -1689,35 +1554,65 @@ def handle_staging_req(
                 )
                 lifecycle.chunk_states[chunk_idx] = "OVERSIZED"
             else:
-                alloc_id, offset, rnd = result
-                end = offset + required
-                infos[chunk_idx] = (alloc_id, offset, rnd, end, chunk_num_pages)
-                lifecycle.chunk_states[chunk_idx] = "WRITABLE"
+                result = staging_allocator.assign(required)
+                if result is None:
+                    # Pool is full: queue the request; a release grants it in
+                    # FIFO order and answers with STAGING_RSP then.
+                    infos[chunk_idx] = (-1, -1, 0, -1, chunk_num_pages)
+                    lifecycle.chunk_states[chunk_idx] = "PENDING_ALLOC"
+                    pending = True
+                else:
+                    alloc_id, offset, rnd = result
+                    end = offset + required
+                    infos[chunk_idx] = (alloc_id, offset, rnd, end, chunk_num_pages)
+                    lifecycle.chunk_states[chunk_idx] = "WRITABLE"
 
     if violation is not None:
         logger.error(violation)
         staging_handler.fail_staging_room(room, violation)
         return
 
+    if pending:
+        staging_handler.enqueue_pending_alloc(
+            room, chunk_idx, required, session_id, chunk_num_pages
+        )
+        return
+    send_staging_rsp(
+        receiver, room_bootstrap, room, chunk_idx, offset, rnd, end, session_id
+    )
+
+
+def send_staging_rsp(
+    receiver,
+    room_bootstrap: dict,
+    room: int,
+    chunk_idx: int,
+    offset: int,
+    rnd: int,
+    end: int,
+    session_id: str,
+) -> None:
+    """Answer a STAGING_REQ on every bootstrap endpoint of the room."""
     bootstrap_infos = room_bootstrap.get(room)
-    if bootstrap_infos:
-        for bi in bootstrap_infos:
-            try:
-                sock, lock = receiver._connect_to_bootstrap_server(bi)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            b"STAGING_RSP",
-                            str(room).encode("ascii"),
-                            str(chunk_idx).encode("ascii"),
-                            str(offset).encode("ascii"),
-                            str(rnd).encode("ascii"),
-                            str(end).encode("ascii"),
-                            session_id.encode("ascii"),
-                        ]
-                    )
-            except Exception:
-                pass
+    if not bootstrap_infos:
+        return
+    for bi in bootstrap_infos:
+        try:
+            sock, lock = receiver._connect_to_bootstrap_server(bi)
+            with lock:
+                sock.send_multipart(
+                    [
+                        b"STAGING_RSP",
+                        str(room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(offset).encode("ascii"),
+                        str(rnd).encode("ascii"),
+                        str(end).encode("ascii"),
+                        session_id.encode("ascii"),
+                    ]
+                )
+        except Exception:
+            pass
 
 
 def prefetch_staging_reqs(

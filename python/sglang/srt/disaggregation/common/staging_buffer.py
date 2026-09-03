@@ -177,21 +177,22 @@ class StagingBuffer:
 
 
 class StagingAllocator:
-    """Decode-side dynamic staging ring buffer allocator with overcommit.
+    """Decode-side staging allocator: best-fit free list with coalescing.
 
-    One large pre-allocated GPU buffer used as a ring buffer. Each request
-    gets a (alloc_id, offset, round) triple based on its actual byte
-    requirement. Allocation (assign) is overcommit — it always succeeds
-    as long as the request fits in the buffer. Overlap safety is enforced
-    on the prefill side before RDMA, using a watermark that tracks the
-    oldest un-freed allocation.
+    One large pre-allocated GPU buffer. Each STAGING_REQ gets an exclusive
+    byte extent for as long as the chunk lives; a granted extent is writable
+    immediately, releases are independent of each other, and a slow room
+    only pins its own extent. When no extent fits, ``assign`` returns None
+    and the caller queues the request until a release frees space.
 
-    The watermark (round, tail_offset) is periodically sent to prefill.
-    Prefill transfer workers wait before writing if their target region
-    overlaps with not-yet-freed data from a previous round.
+    This replaces the FIFO ring whose global watermark let one slow room
+    stall every prefill session (2026-08-20, 2026-09-01, 2026-09-03).
+    ``round`` in the returned triple is always 0: prefill treats round 0 as
+    "no watermark wait", so the wire format and the prefill side are
+    unchanged.
     """
 
-    # Permanent alloc failure: chunk exceeds ring buffer total size.
+    # Permanent alloc failure: chunk exceeds the buffer total size.
     ALLOC_OVERSIZED = -2
 
     def __init__(
@@ -204,60 +205,68 @@ class StagingAllocator:
         self.buffer = StagingBuffer(total_size_bytes, device, gpu_id, custom_mem_pool)
         self.total_size = total_size_bytes
         self.base_ptr = self.buffer.data_ptr
-        self.head = 0
-        self.round = 0
-        self.allocations: dict = {}  # alloc_id -> (offset, size, round)
-        self.alloc_order: List[int] = []
-        # A quarantined allocation pins its position in allocations/alloc_order
-        # until this process exits. It is never returned to the ring.
+        # Sorted by offset, non-overlapping, never adjacent (always coalesced).
+        self.free_extents: List[Tuple[int, int]] = [(0, total_size_bytes)]
+        self.allocations: dict = {}  # alloc_id -> (offset, size, 0)
+        # A quarantined allocation is never returned to the free list.
         self.quarantined_allocations: set[int] = set()
         self.quarantine_count = 0
         self.invariant_counters = StagingInvariantCounters()
         self._quarantine_callback = None
         self.next_alloc_id = 0
-        self.watermark_round = 0
-        self.watermark_tail = 0
         self.lock = threading.Lock()
         # Lazily created by the first decode-side scatter.  Keeping the
         # attribute present lets abort cleanup safely drain in-flight work.
         self._scatter_stream = None
-
         logger.info(
-            f"StagingAllocator (ring+overcommit): "
+            f"StagingAllocator (best-fit free list): "
             f"{total_size_bytes / (1024*1024):.1f} MB "
             f"on {device}, ptr=0x{self.base_ptr:x}"
         )
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
-        """Allocate a region. Returns (alloc_id, offset, round) or None."""
+        """Grant an exclusive extent. Returns (alloc_id, offset, 0) or None.
+
+        None means "nothing fits right now"; the caller decides whether that
+        is OVERSIZED (required_bytes > total_size) or a wait for a release.
+        """
+        if required_bytes <= 0:
+            return None
         with self.lock:
             if required_bytes > self.total_size:
                 return None
-
-            space_at_end = self.total_size - self.head
-            if required_bytes <= space_at_end:
-                offset = self.head
-                self.head += required_bytes
+            best = -1
+            best_size = None
+            for i, (_, size) in enumerate(self.free_extents):
+                if size >= required_bytes and (best_size is None or size < best_size):
+                    best, best_size = i, size
+                    if size == required_bytes:
+                        break
+            if best < 0:
+                return None
+            offset, size = self.free_extents[best]
+            if size == required_bytes:
+                self.free_extents.pop(best)
             else:
-                self.round += 1
-                offset = 0
-                self.head = required_bytes
-
+                self.free_extents[best] = (
+                    offset + required_bytes,
+                    size - required_bytes,
+                )
             alloc_id = self.next_alloc_id
             self.next_alloc_id += 1
-            self.allocations[alloc_id] = (offset, required_bytes, self.round)
-            self.alloc_order.append(alloc_id)
-            return (alloc_id, offset, self.round)
+            self.allocations[alloc_id] = (offset, required_bytes, 0)
+            return (alloc_id, offset, 0)
 
     def set_quarantine_callback(self, callback) -> None:
         self._quarantine_callback = callback
 
     def quarantine(self, alloc_id: int, reason: str = "") -> bool:
-        """Permanently pin an allocation. Returns True if it is (now) quarantined.
+        """Permanently withhold an allocation from the free list.
 
-        The callback fires once per newly quarantined allocation so the owner
-        can decide between isolating and process-level fail-stop from the
-        accumulated quarantined capacity and the reason class.
+        Returns True if the allocation is (now) quarantined. The callback
+        fires once per newly quarantined allocation so the owner can decide
+        between isolating and process-level fail-stop from the accumulated
+        quarantined capacity and the reason class.
         """
         newly_quarantined = False
         with self.lock:
@@ -288,12 +297,12 @@ class StagingAllocator:
         )
 
     def quarantined_bytes(self) -> int:
-        """Ring capacity permanently lost to quarantined allocations."""
+        """Capacity permanently lost to quarantined allocations."""
         with self.lock:
             return self._quarantined_bytes_locked()
 
     def free(self, alloc_id: int) -> bool:
-        """Free an allocation and advance watermark past consecutive freed entries."""
+        """Return an extent to the free list, coalescing with its neighbours."""
         with self.lock:
             if alloc_id not in self.allocations:
                 return False
@@ -301,29 +310,48 @@ class StagingAllocator:
                 count = self.invariant_counters.increment("free_quarantined")
                 logger.error(
                     "[STAGING_INVARIANT] free_quarantined=%s alloc_id=%s; "
-                    "ignoring free to keep the ring watermark pinned",
+                    "ignoring free to keep the extent withheld",
                     count,
                     alloc_id,
                 )
                 return False
-            self.allocations.pop(alloc_id)
-
-            while self.alloc_order and self.alloc_order[0] not in self.allocations:
-                self.alloc_order.pop(0)
-
-            if not self.allocations:
-                self.watermark_round = self.round
-                self.watermark_tail = self.head
-            elif self.alloc_order:
-                off, _, rnd = self.allocations[self.alloc_order[0]]
-                self.watermark_round = rnd
-                self.watermark_tail = off
+            offset, size, _ = self.allocations.pop(alloc_id)
+            self._insert_free_locked(offset, size)
             return True
 
-    def get_watermark(self) -> Tuple[int, int]:
-        """Return (round, tail_offset). Everything before this is safe to write."""
+    def _insert_free_locked(self, offset: int, size: int) -> None:
+        extents = self.free_extents
+        lo, hi = 0, len(extents)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if extents[mid][0] < offset:
+                lo = mid + 1
+            else:
+                hi = mid
+        start, end = offset, offset + size
+        # Merge with the right neighbour.
+        if lo < len(extents) and extents[lo][0] == end:
+            end = extents[lo][0] + extents[lo][1]
+            extents.pop(lo)
+        # Merge with the left neighbour.
+        if lo > 0 and extents[lo - 1][0] + extents[lo - 1][1] == start:
+            start = extents[lo - 1][0]
+            extents.pop(lo - 1)
+            lo -= 1
+        extents.insert(lo, (start, end - start))
+
+    def free_bytes(self) -> int:
         with self.lock:
-            return (self.watermark_round, self.watermark_tail)
+            return sum(size for _, size in self.free_extents)
+
+    def largest_extent(self) -> int:
+        with self.lock:
+            return max((size for _, size in self.free_extents), default=0)
+
+    def get_watermark(self) -> Tuple[int, int]:
+        """Compatibility: extents are exclusive from grant, so there is no
+        watermark. Round 0 tells prefill it never has to wait."""
+        return (0, 0)
 
     def get_ptr(self, alloc_id: int) -> int:
         offset, _, _ = self.allocations[alloc_id]

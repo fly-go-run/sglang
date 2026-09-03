@@ -96,7 +96,7 @@ def _make_staging_handler(scatter_done):
     handler._room_to_decode_req = {ROOM: decode_req}
     handler._room_to_receiver = {ROOM: receiver}
     handler._room_lifecycles = {ROOM: lifecycle}
-    handler._free_and_send_watermark = MagicMock()
+    handler._free_allocation = MagicMock()
     return handler, decode_req, receiver
 
 
