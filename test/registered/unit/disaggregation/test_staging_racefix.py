@@ -516,13 +516,18 @@ class TestStagingRaceFix(CustomTestCase):
         allocator.assign.assert_not_called()
         self.assertEqual(handler.invariant_counters.get("alloc_after_terminal"), 1)
 
-    def test_first_quarantine_arms_one_process_exit_timer(self):
+    @staticmethod
+    def _make_quarantine_handler(total_size=1000, quarantined_bytes=0):
         handler = object.__new__(DecodeStagingHandler)
         handler.scheduler = SimpleNamespace(set_system_status=MagicMock())
         handler._quarantine_exit_lock = threading.Lock()
         handler._quarantine_exit_timer = None
         handler._fatal_shutdown = MagicMock()
-        handler.staging_allocator = SimpleNamespace(quarantine_count=1)
+        handler.staging_allocator = SimpleNamespace(
+            quarantine_count=1,
+            total_size=total_size,
+            quarantined_bytes=MagicMock(return_value=quarantined_bytes),
+        )
         timers = []
 
         class FakeTimer:
@@ -535,6 +540,10 @@ class TestStagingRaceFix(CustomTestCase):
             def start(self):
                 pass
 
+        return handler, timers, FakeTimer
+
+    def test_invariant_violation_quarantine_arms_one_process_exit_timer(self):
+        handler, timers, FakeTimer = self._make_quarantine_handler()
         with (
             patch(
                 "sglang.srt.disaggregation.common.staging_handler.random.uniform",
@@ -545,15 +554,69 @@ class TestStagingRaceFix(CustomTestCase):
                 FakeTimer,
             ),
         ):
-            handler._on_first_quarantine(4, "test")
-            handler._on_first_quarantine(5, "duplicate")
+            handler._on_quarantine(4, "[STAGING_GEOMETRY] overlapping writer")
+            handler._on_quarantine(5, "[STAGING_WRITER] invalid slot")
 
+        handler.scheduler.set_system_status.assert_called_once_with("notready")
         self.assertEqual(len(timers), 1)
         self.assertEqual(timers[0].delay, 12.5)
         timers[0].callback()
         handler._fatal_shutdown.assert_called_once_with(
             -1, 1, reason="staging-quarantine"
         )
+
+    def test_stall_quarantine_below_capacity_threshold_only_isolates(self):
+        handler, timers, FakeTimer = self._make_quarantine_handler(
+            total_size=1000, quarantined_bytes=50
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.staging_handler.threading.Timer",
+            FakeTimer,
+        ):
+            handler._on_quarantine(4, "staging-stall")
+            handler._on_quarantine(5, "decode-transfer-failed")
+            handler._on_quarantine(6, "room-release")
+
+        self.assertEqual(timers, [])
+        handler.scheduler.set_system_status.assert_not_called()
+        handler._fatal_shutdown.assert_not_called()
+
+    def test_quarantined_capacity_over_threshold_arms_process_exit(self):
+        handler, timers, FakeTimer = self._make_quarantine_handler(
+            total_size=1000, quarantined_bytes=150
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler.random.uniform",
+                return_value=3.0,
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler.threading.Timer",
+                FakeTimer,
+            ),
+        ):
+            handler._on_quarantine(4, "staging-stall")
+
+        handler.scheduler.set_system_status.assert_called_once_with("notready")
+        self.assertEqual(len(timers), 1)
+        timers[0].callback()
+        handler._fatal_shutdown.assert_called_once_with(
+            -1, 1, reason="staging-quarantine"
+        )
+
+    def test_allocator_reports_quarantined_bytes_and_fires_per_allocation(self):
+        allocator = _cpu_allocator(size=256)
+        first = allocator.assign(64)[0]
+        second = allocator.assign(32)[0]
+        callback = MagicMock()
+        allocator.set_quarantine_callback(callback)
+
+        self.assertTrue(allocator.quarantine(first, "staging-stall"))
+        self.assertTrue(allocator.quarantine(second, "room-release"))
+        self.assertTrue(allocator.quarantine(second, "duplicate"))
+        self.assertEqual(allocator.quarantine_count, 2)
+        self.assertEqual(allocator.quarantined_bytes(), 96)
+        self.assertEqual(callback.call_count, 2)
 
     def test_scatter_drain_timeout_requests_process_exit(self):
         handler = object.__new__(DecodeStagingHandler)

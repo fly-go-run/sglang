@@ -253,24 +253,44 @@ class StagingAllocator:
         self._quarantine_callback = callback
 
     def quarantine(self, alloc_id: int, reason: str = "") -> bool:
-        """Permanently pin an allocation. Returns True on the first quarantine."""
-        first_quarantine = False
+        """Permanently pin an allocation. Returns True if it is (now) quarantined.
+
+        The callback fires once per newly quarantined allocation so the owner
+        can decide between isolating and process-level fail-stop from the
+        accumulated quarantined capacity and the reason class.
+        """
+        newly_quarantined = False
         with self.lock:
             if alloc_id not in self.allocations:
                 return False
             if alloc_id not in self.quarantined_allocations:
                 self.quarantined_allocations.add(alloc_id)
                 self.quarantine_count += 1
-                first_quarantine = self.quarantine_count == 1
+                newly_quarantined = True
                 logger.error(
-                    "[STAGING_QUARANTINE] alloc_id=%s reason=%s quarantine_count=%s",
+                    "[STAGING_QUARANTINE] alloc_id=%s reason=%s quarantine_count=%s "
+                    "quarantined_bytes=%s total=%s",
                     alloc_id,
                     reason,
                     self.quarantine_count,
+                    self._quarantined_bytes_locked(),
+                    self.total_size,
                 )
-        if first_quarantine and self._quarantine_callback is not None:
+        if newly_quarantined and self._quarantine_callback is not None:
             self._quarantine_callback(alloc_id, reason)
         return True
+
+    def _quarantined_bytes_locked(self) -> int:
+        return sum(
+            self.allocations[alloc_id][1]
+            for alloc_id in self.quarantined_allocations
+            if alloc_id in self.allocations
+        )
+
+    def quarantined_bytes(self) -> int:
+        """Ring capacity permanently lost to quarantined allocations."""
+        with self.lock:
+            return self._quarantined_bytes_locked()
 
     def free(self, alloc_id: int) -> bool:
         """Free an allocation and advance watermark past consecutive freed entries."""

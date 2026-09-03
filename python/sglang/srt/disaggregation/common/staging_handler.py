@@ -65,6 +65,16 @@ STAGING_DEMOTED_TIMEOUT_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_DEMOTED_TIMEOUT_S", "60")
 )
 
+# Quarantine isolates ring memory whose writer cannot be proven stopped; that
+# alone is safe, so a quarantine caused by a stall, a failed transfer or a
+# room released with live allocations only costs capacity. Process-level
+# fail-stop (NotReady + exit, Kubernetes rebuilds clean memory) is reserved
+# for two cases: an invariant violation that says memory may already be
+# corrupted, or quarantined capacity exceeding this fraction of the ring.
+STAGING_QUARANTINE_EXIT_FRACTION = float(
+    os.environ.get("SGLANG_DISAGG_STAGING_QUARANTINE_EXIT_FRACTION", "0.10")
+)
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -160,7 +170,7 @@ class DecodeStagingHandler:
         self.invariant_counters = staging_allocator.invariant_counters
         self._quarantine_exit_lock = threading.Lock()
         self._quarantine_exit_timer = None
-        self.staging_allocator.set_quarantine_callback(self._on_first_quarantine)
+        self.staging_allocator.set_quarantine_callback(self._on_quarantine)
         self.staging_allocator._staging_handler = self
         self._wm_subscribers: dict = {}
         self._wm_next_generation = 0
@@ -492,12 +502,49 @@ class DecodeStagingHandler:
             "continuing with process-level exit"
         )
 
-    def _on_first_quarantine(self, alloc_id: int, reason: str) -> None:
+    @staticmethod
+    def _quarantine_is_invariant_violation(reason: str) -> bool:
+        """Reasons tagged [STAGING_*] come from geometry/writer/lifecycle
+        fences: memory may already hold foreign data. Plain reasons
+        (staging-stall, decode-transfer-failed, room-release) are wedges or
+        failures where isolating the allocation is sufficient."""
+        return reason.startswith("[STAGING_")
+
+    def _on_quarantine(self, alloc_id: int, reason: str) -> None:
+        """Isolate by default; escalate to process fail-stop only when needed."""
+        allocator = self.staging_allocator
+        if self._quarantine_is_invariant_violation(reason):
+            self._arm_process_exit(alloc_id, reason)
+            return
+        total = max(1, getattr(allocator, "total_size", 1))
+        quarantined = allocator.quarantined_bytes()
+        fraction = quarantined / total
+        if fraction > STAGING_QUARANTINE_EXIT_FRACTION:
+            self._arm_process_exit(
+                alloc_id,
+                f"staging-quarantine-capacity fraction={fraction:.3f} "
+                f"quarantined_bytes={quarantined} total={total} last_reason={reason}",
+            )
+            return
+        logger.error(
+            "[STAGING_QUARANTINE_ISOLATED] alloc_id=%s reason=%s "
+            "quarantine_count=%s quarantined_bytes=%s total=%s fraction=%.3f "
+            "(below exit fraction %.3f; serving continues)",
+            alloc_id,
+            reason,
+            allocator.quarantine_count,
+            quarantined,
+            total,
+            fraction,
+            STAGING_QUARANTINE_EXIT_FRACTION,
+        )
+
+    def _arm_process_exit(self, alloc_id: int, reason: str) -> None:
         """Mark notready and arm exactly one process-level fail-stop timer."""
-        self._set_dynamo_notready_best_effort()
         with self._quarantine_exit_lock:
             if self._quarantine_exit_timer is not None:
                 return
+            self._set_dynamo_notready_best_effort()
             delay_s = random.uniform(0.0, 60.0)
 
             def request_exit():
@@ -523,8 +570,10 @@ class DecodeStagingHandler:
             self._quarantine_exit_timer = timer
             timer.start()
         logger.error(
-            "[STAGING_QUARANTINE_EXIT] scheduled process-level exit in %.3fs",
+            "[STAGING_QUARANTINE_EXIT] scheduled process-level exit in %.3fs "
+            "(reason=%s)",
             delay_s,
+            reason,
         )
 
     def _outstanding_alloc_ids(self, decode_req, receiver) -> set[int]:
@@ -597,8 +646,9 @@ class DecodeStagingHandler:
         alloc_ids = self._terminalize_room(room, reason)
         if not alloc_ids:
             return
-        # The quarantine callback has already armed the independent 0-60s
-        # process exit. A stuck CUDA drain therefore cannot suppress fail-stop.
+        # A stuck CUDA drain escalates to fail-stop on its own (see
+        # _drain_scatter_bounded); quarantine itself only isolates unless the
+        # reason or the lost capacity says otherwise (see _on_quarantine).
         self._drain_scatter_bounded(room)
 
     def fail_staging_room(self, room: int, reason: str) -> None:
