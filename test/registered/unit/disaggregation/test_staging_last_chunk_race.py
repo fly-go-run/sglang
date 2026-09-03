@@ -67,7 +67,6 @@ def _make_handler(geometry, chunk_infos, num_writers=1):
         _staging_all_success=False,
         _staging_success_ts=0.0,
         _chunk_events=[],
-        _staging_demoted_since=None,
     )
     lifecycle = StagingRoomLifecycle(
         chunk_states={idx: "WRITABLE" for idx in geometry},

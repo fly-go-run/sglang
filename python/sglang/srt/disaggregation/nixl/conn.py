@@ -478,6 +478,11 @@ class NixlKVManager(CommonKVManager):
         self.kv_buffer_tensors = None
         self._staging_ctx = None
         self._staging_handler = None
+        # Installed by the decode transfer queue: receivers ask it before caching
+        # Success so the waiting timeout covers metadata landing and staging
+        # scatter, not just the transport.
+        self.completion_gate = None
+        self.completion_snapshot = None
         # add_transfer_request() runs on the scheduler thread while
         # transfer_worker(), abort handling, and sender.clear() can retire the
         # same room concurrently. Keep the staging completion fence and the
@@ -3242,6 +3247,7 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
+        self._completion_gate_blocked = False
 
     def send_metadata(
         self,
@@ -3321,10 +3327,28 @@ class NixlKVReceiver(CommonKVReceiver):
 
         timeout_result = self._check_waiting_timeout()
         if timeout_result is not None:
+            if getattr(self, "_completion_gate_blocked", False):
+                snapshot = getattr(self.kv_mgr, "completion_snapshot", None)
+                logger.error(
+                    "[STAGING_COMPLETION_TIMEOUT] room=%s transport delivered "
+                    "every chunk but the completion gate never released; %s",
+                    self.bootstrap_room,
+                    snapshot(self.bootstrap_room) if callable(snapshot) else "",
+                )
             return timeout_result
 
         self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
+            gate = getattr(self.kv_mgr, "completion_gate", None)
+            if gate is not None and not gate(self.bootstrap_room):
+                # The transport delivered everything, but the first-token
+                # metadata stamp or the staged scatter has not landed yet.
+                # Do not cache Success: the waiting timeout keeps running until
+                # every gate releases, so a gate that never releases fails the
+                # request instead of parking it in the transfer queue.
+                self._completion_gate_blocked = True
+                return KVPoll.Transferring  # type: ignore
+            self._completion_gate_blocked = False
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )

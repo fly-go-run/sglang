@@ -1849,6 +1849,72 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
+        kv_manager.completion_gate = self._completion_gate
+        kv_manager.completion_snapshot = self._completion_snapshot
+
+    def _find_decode_req(self, room: int) -> Optional[DecodeRequest]:
+        handler = self.staging_handler
+        if handler is not None:
+            decode_req = handler._room_to_decode_req.get(room)
+            if decode_req is not None:
+                return decode_req
+        for decode_req in self.queue:
+            if decode_req.req.bootstrap_room == room:
+                return decode_req
+        return None
+
+    def _completion_gate(self, room: int) -> bool:
+        """Transport done is not request done.
+
+        Called by the NIXL receiver before it caches Success. The first-token
+        metadata must have landed (its bootstrap_room stamp is non-zero) and,
+        for hetero-TP rooms, the staged KV must be scattered into the pool.
+        Keeping this inside poll() means the receiver's waiting timeout bounds
+        the whole path; a gate that never releases fails the request.
+        """
+        decode_req = self._find_decode_req(room)
+        if decode_req is None:
+            return True
+        if not _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+            idx = decode_req.metadata_buffer_index
+            if idx is None or idx < 0:
+                return False
+            if int(self.metadata_buffers.bootstrap_room[idx, 0].item()) == 0:
+                return False
+        receiver = decode_req.kv_receiver
+        handler = self.staging_handler
+        if (
+            handler is not None
+            and receiver is not None
+            and getattr(receiver, "require_staging", False)
+        ):
+            # Transport done is the authoritative all-ranks Success; record it
+            # here rather than from notification order (see #30545 model).
+            if not getattr(decode_req, "_staging_all_success", False):
+                handler.submit_last_scatter_async(room)
+            handler.advance_scatter(decode_req)
+            if not handler.is_done(decode_req):
+                return False
+        return True
+
+    def _completion_snapshot(self, room: int) -> str:
+        decode_req = self._find_decode_req(room)
+        if decode_req is None:
+            return "decode_req=None"
+        metadata_room = None
+        try:
+            metadata_room = int(
+                self.metadata_buffers.bootstrap_room[
+                    decode_req.metadata_buffer_index, 0
+                ].item()
+            )
+        except Exception:
+            pass
+        if self.staging_handler is not None:
+            return self.staging_handler.completion_snapshot(
+                room, decode_req, decode_req.kv_receiver, metadata_room
+            )
+        return f"metadata_room={metadata_room}"
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:

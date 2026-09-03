@@ -50,21 +50,6 @@ STAGING_SCATTER_DRAIN_TIMEOUT_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_SCATTER_DRAIN_TIMEOUT_S", "5")
 )
 
-# A room whose NIXL transfer already concluded Success can still be held in
-# Transferring by a completion gate: the staging scatter is not marked done, or
-# the metadata bootstrap_room stamp has not landed. Once the receiver caches
-# Success it never re-runs its waiting timeout, and the stall watchdog above
-# only runs while ring allocations are held, so a gate that never releases
-# parks the request in the transfer queue forever (observed 2026-09-03: 68
-# requests left in #transfer-req with no log line, never aborted by the
-# frontend because no first response ever reached it). Bound that state here.
-# The clock only runs while the room holds no allocations, so it never overlaps
-# the stall watchdog or its quarantine path; failing the room routes it through
-# the existing Failed -> pop_transferred -> release path with an error reply.
-STAGING_DEMOTED_TIMEOUT_S = float(
-    os.environ.get("SGLANG_DISAGG_STAGING_DEMOTED_TIMEOUT_S", "60")
-)
-
 # Quarantine isolates ring memory whose writer cannot be proven stopped; that
 # alone is safe, so a quarantine caused by a stall, a failed transfer or a
 # room released with live allocations only costs capacity. Process-level
@@ -680,9 +665,6 @@ class DecodeStagingHandler:
         decode_req._staging_data_started = False
         decode_req._staging_stall_since = None
         decode_req._staging_stall_failed = False
-        # Demoted clock: set when raw poll is Success but a completion gate
-        # keeps the room in Transferring while it holds no allocations.
-        decode_req._staging_demoted_since = None
         self._room_lifecycles[room] = StagingRoomLifecycle()
         self._room_to_decode_req[room] = decode_req
         self._room_to_receiver[room] = decode_req.kv_receiver
@@ -1175,67 +1157,10 @@ class DecodeStagingHandler:
         )
         return any(info[0] >= 0 for info in chunk_infos)
 
-    def check_demoted_timeout(
-        self,
-        decode_req: DecodeRequest,
-        staging_demoted: bool,
-        metadata_demoted: bool,
-        metadata_room=None,
-    ) -> bool:
-        """Fail a room parked at raw Success behind a completion gate.
-
-        Runs on the scheduler main thread from poll_and_all_reduce_with_staging
-        after the staging/metadata gates were applied. Returns True when the
-        room was failed here so the caller reports KVPoll.Failed and the
-        existing Failed -> pop_transferred -> release path cleans it up.
-        Rooms that still hold ring allocations are left to _check_room_stall,
-        so this clock and the stall watchdog never run on the same room.
-        """
-        room = decode_req.req.bootstrap_room
-        if not (staging_demoted or metadata_demoted):
-            decode_req._staging_demoted_since = None
-            return False
-        receiver = decode_req.kv_receiver
-        if receiver is None:
-            receiver = self._room_to_receiver.get(room)
-        if self._room_holds_allocations(decode_req, receiver):
-            decode_req._staging_demoted_since = None
-            return False
-        now = time.monotonic()
-        since = getattr(decode_req, "_staging_demoted_since", None)
-        if since is None:
-            decode_req._staging_demoted_since = now
-            return False
-        elapsed = now - since
-        if elapsed <= STAGING_DEMOTED_TIMEOUT_S:
-            return False
-        snapshot = self._demoted_snapshot(room, decode_req, receiver, metadata_room)
-        logger.error(
-            "[STAGING_DEMOTED_TIMEOUT] room=%s raw poll Success but held in "
-            "Transferring for %.0fs (staging_gate=%s metadata_gate=%s) %s; "
-            "failing the request instead of parking it forever.",
-            room,
-            elapsed,
-            staging_demoted,
-            metadata_demoted,
-            snapshot,
-        )
-        from sglang.srt.disaggregation.base.conn import KVPoll
-
-        self.kv_manager.record_failure(
-            room,
-            f"[STAGING_DEMOTED_TIMEOUT] transfer concluded but completion gate "
-            f"never released for {elapsed:.0f}s "
-            f"(staging_gate={staging_demoted} metadata_gate={metadata_demoted})",
-        )
-        self.kv_manager.update_status(room, KVPoll.Failed)
-        if receiver is not None:
-            receiver.conclude_state = KVPoll.Failed
-        decode_req._staging_demoted_since = None
-        return True
-
-    def _demoted_snapshot(self, room: int, decode_req, receiver, metadata_room) -> str:
-        """One-line state dump used to attribute a demoted-timeout failure."""
+    def completion_snapshot(
+        self, room: int, decode_req, receiver, metadata_room
+    ) -> str:
+        """One-line state dump used to attribute a completion timeout."""
         lifecycle = self._room_lifecycles.get(room)
         status = getattr(self.kv_manager, "transfer_statuses", {}).get(room)
         received = getattr(status, "received_kvs_per_pp", None) or {}
