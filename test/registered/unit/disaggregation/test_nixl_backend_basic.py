@@ -101,6 +101,8 @@ class FakeStagingBuffer:
 class FakeStagingAllocator:
     ALLOC_OVERSIZED = -2
 
+    def max_attainable_extent(self):
+        return getattr(self, "total_size", 1 << 40)
 
 def _fake_staging_buffer_module(mock_gather=None):
     module = types.ModuleType("sglang.srt.disaggregation.common.staging_buffer")
@@ -351,6 +353,53 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
         return mgr
+
+    def test_sender_failure_notifies_decode_with_staging_fail(self):
+        from sglang.srt.utils.network import NetworkAddress
+
+        mgr = self._make_manager({17: KVPoll.Transferring})
+        mgr.enable_staging = True
+        mgr.transfer_infos = {
+            17: {"decode-a": SimpleNamespace(endpoint="127.0.0.1", dst_port=5555)}
+        }
+        sock = MagicMock()
+        ep = NetworkAddress("127.0.0.1", 5555).to_tcp()
+        mgr._staging_ctx = SimpleNamespace(prefetch_sockets={ep: sock})
+
+        mgr._notify_decode_staging_fail(17, "boom")
+
+        sock.send_multipart.assert_called_once_with(
+            [b"STAGING_FAIL", b"17", b"boom"]
+        )
+
+    def test_staging_fail_message_fails_staging_room_immediately(self):
+        mgr = self._make_manager({17: KVPoll.WaitingForInput})
+        handler = MagicMock()
+        handler.is_staging_room.return_value = True
+        mgr._staging_handler = handler
+
+        mgr._handle_staging_fail([b"STAGING_FAIL", b"17", b"prefill boom"])
+
+        handler.fail_staging_room.assert_called_once()
+        self.assertEqual(handler.fail_staging_room.call_args.args[0], 17)
+        reason = handler.fail_staging_room.call_args.args[1]
+        self.assertIn("prefill-transfer-failed", reason)
+        # Must not read as a "[STAGING_*]" invariant violation, which would
+        # fail-stop the decode on the first prefill-reported failure.
+        self.assertFalse(reason.startswith("[STAGING_"))
+        self.assertNotIn("[STAGING_", reason)
+
+    def test_staging_fail_message_fails_plain_room_via_status(self):
+        mgr = self._make_manager({17: KVPoll.WaitingForInput})
+        mgr._staging_handler = None
+
+        mgr._handle_staging_fail([b"STAGING_FAIL", b"17", b"prefill boom"])
+
+        self.assertEqual(mgr.request_status[17], KVPoll.Failed)
+        self.assertIn("prefill-transfer-failed", mgr.failure_records[17])
+        # Unknown rooms are ignored.
+        mgr._handle_staging_fail([b"STAGING_FAIL", b"99", b"x"])
+        self.assertNotIn(99, mgr.request_status)
 
     def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
         self,
@@ -839,27 +888,55 @@ class TestNixlStaging(CustomTestCase):
             ],
         )
 
-    def test_timed_out_xfer_with_successful_cancel_does_not_fail_stop(self):
+    def test_transport_deadline_fails_request_without_fail_stop(self):
+        # The UCX plugin reports an exhausted GRANT/ACK retransmit budget as
+        # NIXL_ERR_CANCELED (not REMOTE_DISCONNECT, which would make the agent
+        # drop the peer's metadata); SGLang no longer keeps its own 45 s clock.
         agent = MagicMock()
-        agent.check_xfer_state.side_effect = ["PROC", "PROC", "DONE"]
+        agent.check_xfer_state.side_effect = [
+            "PROC",
+            RuntimeError("getXferStatus: NIXL_ERR_CANCELED"),
+        ]
         mgr = self._make_manager(agent)
         mgr._request_fatal_transfer_shutdown = MagicMock()
 
-        with (
-            patch(
-                "sglang.srt.disaggregation.nixl.conn." "STAGING_HANDLE_WAIT_TIMEOUT_S",
-                0,
-            ),
-            patch(
-                "sglang.srt.disaggregation.nixl.conn.time.monotonic",
-                side_effect=[0.0, 1.0],
-            ),
+        with self.assertRaisesRegex(
+            StagingTransferCancelledError, "STAGING_TRANSPORT_DEADLINE"
         ):
-            with self.assertRaises(StagingTransferCancelledError):
-                mgr._wait_for_xfers(["handle"], 17, 0, False)
+            mgr._wait_for_xfers(["handle"], 17, 0, False, staging_transfer=True)
+
+        mgr._request_fatal_transfer_shutdown.assert_not_called()
+        # The terminal handle is released, not leaked.
+        agent.release_xfer_handle.assert_called_once_with("handle")
+
+    def test_peer_gone_releases_the_raising_handle(self):
+        agent = MagicMock()
+        agent.check_xfer_state.side_effect = RuntimeError(
+            "getXferStatus: NIXL_ERR_REMOTE_DISCONNECT"
+        )
+        mgr = self._make_manager(agent)
+        mgr._request_fatal_transfer_shutdown = MagicMock()
+
+        with self.assertRaisesRegex(StagingTransferCancelledError, "STAGING_PEER_GONE"):
+            mgr._wait_for_xfers(["handle"], 17, 0, False)
 
         agent.release_xfer_handle.assert_called_once_with("handle")
         mgr._request_fatal_transfer_shutdown.assert_not_called()
+
+    def test_backend_error_requests_process_tree_shutdown(self):
+        agent = MagicMock()
+        agent.check_xfer_state.side_effect = RuntimeError(
+            "getXferStatus: NIXL_ERR_BACKEND"
+        )
+        mgr = self._make_manager(agent)
+        mgr._request_fatal_transfer_shutdown = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "NIXL_ERR_BACKEND"):
+            mgr._wait_for_xfers(["handle"], 17, 0, False, staging_transfer=True)
+
+        mgr._request_fatal_transfer_shutdown.assert_called_once_with(
+            17, 1, reason="staging-terminal-error"
+        )
 
     def test_terminal_nonstaging_xfer_remains_request_scoped(self):
         agent = MagicMock()
@@ -874,18 +951,18 @@ class TestNixlStaging(CustomTestCase):
 
         mgr._request_fatal_transfer_shutdown.assert_not_called()
 
-    def test_terminal_staging_xfer_requests_process_tree_shutdown(self):
+    def test_terminal_staging_xfer_remains_request_scoped(self):
         agent = MagicMock()
         agent.check_xfer_state.return_value = "ERR"
         mgr = self._make_manager(agent)
         mgr._request_fatal_transfer_shutdown = MagicMock()
 
-        with self.assertRaisesRegex(RuntimeError, "terminal staging transfer error"):
+        with self.assertRaisesRegex(
+            StagingTransferCancelledError, "STAGING_HANDLE_ERR"
+        ):
             mgr._wait_for_xfers(["handle"], 17, 0, False, staging_transfer=True)
 
-        mgr._request_fatal_transfer_shutdown.assert_called_once_with(
-            17, 1, reason="staging-terminal-error"
-        )
+        mgr._request_fatal_transfer_shutdown.assert_not_called()
 
     def test_peer_gone_fails_room_without_process_tree_shutdown(self):
         for error_code in ("NIXL_ERR_REMOTE_DISCONNECT", "NIXL_ERR_NOT_FOUND"):
@@ -908,7 +985,9 @@ class TestNixlStaging(CustomTestCase):
                 mgr._mark_staging_send_failed(17, 3, "decode")
 
                 mgr._request_fatal_transfer_shutdown.assert_not_called()
-                agent.release_xfer_handle.assert_not_called()
+                # The terminal handle is released so its backend state does
+                # not leak; the peer being gone makes that a no-op remotely.
+                agent.release_xfer_handle.assert_called_once_with("handle")
                 self.assertEqual(
                     mgr._staging_ctx.send_ops[(17, 3, "decode")]["state"],
                     "FAILED",

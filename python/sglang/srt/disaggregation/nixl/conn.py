@@ -44,15 +44,11 @@ STAGING_WATERMARK_STALL_TIMEOUT_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_WATERMARK_STALL_TIMEOUT_S", "90")
 )
 
-# Hard cap on busy-polling NIXL transfer handles. Must stay BELOW the
-# decode-side SGLANG_DISAGG_STAGING_STALL_TIMEOUT_S (default 60s): when a
-# handle hangs (e.g. a peer stops draining), the prefill must cancel its
-# in-flight writes BEFORE decode's stall guard frees and eventually reuses
-# the target staging allocations, otherwise a late RDMA write could land in
-# another room's slot.
-STAGING_HANDLE_WAIT_TIMEOUT_S = float(
-    os.environ.get("SGLANG_DISAGG_STAGING_HANDLE_WAIT_TIMEOUT_S", "45")
-)
+# There is deliberately no wall-clock cap on waiting for NIXL transfer handles
+# here. The UCX staged transport enforces its own deadlines (SLOT_GRANT and ACK
+# retransmits with an attempt limit, see NIXL_UCX_STAGING_GRANT_TIMEOUT_MS /
+# ACK_TIMEOUT_MS / MAX_ATTEMPTS) and surfaces a hung peer as
+# NIXL_ERR_REMOTE_DISCONNECT, which fails just this request below.
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -80,9 +76,13 @@ try:
         nixlCancelledError,
     )
     _NIXL_REMOTE_GONE_ERRORS = (nixlRemoteDisconnectError,)
+    _NIXL_BACKEND_ERRORS = (nixlBackendError,)
+    _NIXL_TRANSPORT_DEADLINE_ERRORS = (nixlCancelledError,)
 except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
     _NIXL_REMOTE_GONE_ERRORS = ()
+    _NIXL_BACKEND_ERRORS = ()
+    _NIXL_TRANSPORT_DEADLINE_ERRORS = ()
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,22 @@ class StagingPostAmbiguousError(RuntimeError):
 
 class StagingTransferCancelledError(RuntimeError):
     """A transfer was quiesced and its source is safe to reuse."""
+
+
+def _is_nixl_transport_deadline_error(exc: BaseException) -> bool:
+    """Return whether the UCX staged transport gave up on a peer that stopped
+    answering (SLOT_GRANT / ACK retransmit budget exhausted). The peer is not
+    known to be gone and its metadata stays valid; only this transfer failed."""
+    if isinstance(exc, _NIXL_TRANSPORT_DEADLINE_ERRORS):
+        return True
+    return "NIXL_ERR_CANCELED" in f"{type(exc).__name__}: {exc}".upper()
+
+
+def _is_nixl_backend_error(exc: BaseException) -> bool:
+    """Return whether NIXL reports a permanent backend failure."""
+    if isinstance(exc, _NIXL_BACKEND_ERRORS):
+        return True
+    return "NIXL_ERR_BACKEND" in f"{type(exc).__name__}: {exc}".upper()
 
 
 def _is_nixl_remote_gone_error(exc: BaseException) -> bool:
@@ -650,12 +666,64 @@ class NixlKVManager(CommonKVManager):
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
+                if msg[0] == b"STAGING_FAIL":
+                    self._handle_staging_fail(msg)
+                    continue
                 logger.warning(
                     "decode_staging_thread: unexpected message tag %s",
                     msg[0][:20],
                 )
 
         threading.Thread(target=decode_staging_thread, daemon=True).start()
+
+    def _handle_staging_fail(self, msg) -> None:
+        """Prefill reported a transfer failure for a room: fail it now instead
+        of waiting for the receiver's waiting timeout."""
+        try:
+            room = int(msg[1].decode("ascii"))
+            reason = msg[2].decode("utf-8", errors="replace") if len(msg) > 2 else ""
+        except Exception:
+            logger.warning("[STAGING_FAIL] malformed message %s", msg[:2])
+            return
+        # Not a "[STAGING_*]" invariant violation: the peer failed and told us,
+        # so the room's extents are isolated and only the lost-capacity policy
+        # can escalate (a prefill crash must not fail-stop this decode).
+        reason = (
+            f"prefill-transfer-failed room={room}: "
+            + reason.replace("[STAGING_", "[PREFILL_STAGING_")
+        )
+        logger.warning("[STAGING_PREFILL_FAILED] %s", reason)
+        handler = getattr(self, "_staging_handler", None)
+        if handler is not None and handler.is_staging_room(room):
+            handler.fail_staging_room(room, reason)
+            return
+        if room in self.request_status:
+            self.record_failure(room, reason)
+            self.update_status(room, KVPoll.Failed)
+
+    def _notify_decode_staging_fail(self, room: int, reason: str) -> None:
+        if not self.enable_staging:
+            return
+        from sglang.srt.disaggregation.common.staging_handler import (
+            send_staging_fail,
+        )
+
+        try:
+            notified = send_staging_fail(
+                room,
+                self.transfer_infos,
+                self._staging_ctx.prefetch_sockets,
+                reason,
+            )
+        except Exception:
+            logger.exception("[STAGING_FAIL] notify failed room=%s", room)
+            return
+        logger.warning(
+            "[STAGING_FAIL] room=%s notified %s decode peer(s): %s",
+            room,
+            notified,
+            reason[:160],
+        )
 
     def _handle_staging_req(self, msg):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1302,6 +1370,10 @@ class NixlKVManager(CommonKVManager):
                                         room, kv_chunk.chunk_id, req.agent_name
                                     )
                                     raise
+                                # The staged handle is never appended to
+                                # req_handles (it is waited here); release it
+                                # now or its backend state leaks per chunk.
+                                self._release_xfer_handles([kv_xfer_handle], room)
                                 kv_xfer_handle = None
 
                         if kv_xfer_handle is None and not staging_handled:
@@ -1396,7 +1468,7 @@ class NixlKVManager(CommonKVManager):
                                 room, kv_chunk.chunk_id, req.agent_name
                             )
                         raise
-                    self._release_done_xfer_handles(req_handles, room)
+                    self._release_xfer_handles(req_handles, room)
                     if staging_handled:
                         self._mark_staging_send_done(
                             room, kv_chunk.chunk_id, req.agent_name
@@ -1433,8 +1505,10 @@ class NixlKVManager(CommonKVManager):
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
-                if isinstance(e, _NIXL_TRANSPORT_ERRORS):
-                    logger.warning(f"NIXL transport error for room {room}: {e}")
+                if isinstance(
+                    e, (_NIXL_TRANSPORT_ERRORS, StagingTransferCancelledError)
+                ):
+                    logger.warning(f"Transfer failed for room {room}: {e}")
                 else:
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
@@ -1442,6 +1516,9 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+                # Tell decode before dropping the room's peer info so it fails
+                # the request now rather than at its waiting timeout.
+                self._notify_decode_staging_fail(room, str(e))
                 if self.enable_staging:
                     self._clear_staging_sender_room(room)
 
@@ -1463,7 +1540,11 @@ class NixlKVManager(CommonKVManager):
                 try:
                     state = self.agent.check_xfer_state(handle)
                 except Exception as exc:
-                    if _is_nixl_remote_gone_error(exc):
+                    peer_gone = _is_nixl_remote_gone_error(exc)
+                    if peer_gone or _is_nixl_transport_deadline_error(exc):
+                        # The raising handle is terminal: release it here, the
+                        # siblings are cancelled (and released) below.
+                        self._release_xfer_handles([handle], room)
                         unsafe = self._cancel_pending_xfers(
                             [other for other in handles if other is not handle], room
                         )
@@ -1477,14 +1558,31 @@ class NixlKVManager(CommonKVManager):
                                 f"NIXL peer disappeared for room={room}, but "
                                 f"{len(unsafe)} other transfers remain unsafe"
                             ) from exc
+                        tag = (
+                            "STAGING_PEER_GONE"
+                            if peer_gone
+                            else "STAGING_TRANSPORT_DEADLINE"
+                        )
                         raise StagingTransferCancelledError(
-                            f"[STAGING_PEER_GONE] room={room} peer agent "
-                            f"disappeared; failed the request after all "
-                            f"{len(handles)} transfers became safe"
+                            f"[{tag}] room={room} "
+                            + (
+                                "peer agent disappeared"
+                                if peer_gone
+                                else "peer stopped answering within the transport deadline"
+                            )
+                            + f"; failed the request after all {len(handles)} "
+                            "transfers became safe"
                         ) from exc
-                    self._request_fatal_transfer_shutdown(
-                        room, 1, reason="staging-transfer-state-unknown"
+                    # Anything else is either a permanent backend failure
+                    # (TX/RX staging pool exhausted, CUDA copy failure:
+                    # NIXL_ERR_BACKEND) or a state we cannot reason about.
+                    # Both leave in-flight writes unsafe, so fail-stop.
+                    reason = (
+                        "staging-terminal-error"
+                        if _is_nixl_backend_error(exc)
+                        else "staging-transfer-state-unknown"
                     )
+                    self._request_fatal_transfer_shutdown(room, 1, reason=reason)
                     raise
                 if state == "ERR":
                     unsafe = self._cancel_pending_xfers(handles, room)
@@ -1498,22 +1596,9 @@ class NixlKVManager(CommonKVManager):
                             f"NIXL transfer entered ERR for room={room}, but "
                             f"{len(unsafe)} transfers remain unsafe"
                         )
-                    if staging_transfer:
-                        # The Python NIXL API collapses all terminal backend
-                        # statuses to ERR. For the Prefill staging path, a
-                        # terminal error can mean that the local TX pool or
-                        # the remote Decode RX pool is permanently exhausted.
-                        # Fail-stop this Prefill instead of leaving a worker
-                        # online that may fail every subsequent request.
-                        self._request_fatal_transfer_shutdown(
-                            room,
-                            1,
-                            reason="staging-terminal-error",
-                        )
-                        raise RuntimeError(
-                            f"[STAGING_HANDLE_ERR] room={room} terminal staging "
-                            "transfer error; requesting process-tree shutdown"
-                        )
+                    # The Python binding raises for every terminal error status
+                    # (handled above), so a plain ERR carries no error class;
+                    # keep it request-scoped.
                     raise StagingTransferCancelledError(
                         f"[STAGING_HANDLE_ERR] room={room} transfer failed; "
                         "cancelled remaining transfers and failed the request"
@@ -1535,25 +1620,10 @@ class NixlKVManager(CommonKVManager):
                     is_last_chunk,
                 )
                 next_handle_log_s += 10.0
-            if elapsed_s > STAGING_HANDLE_WAIT_TIMEOUT_S:
-                uncancelled = self._cancel_pending_xfers(handles, room)
-                if uncancelled:
-                    self._request_fatal_transfer_shutdown(room, len(uncancelled))
-                    raise RuntimeError(
-                        f"[STAGING_HANDLE_TIMEOUT] room={room} has "
-                        f"{len(uncancelled)} uncancelled transfers"
-                    )
-                raise StagingTransferCancelledError(
-                    f"[STAGING_HANDLE_TIMEOUT] room={room} NIXL transfer not "
-                    f"DONE after {elapsed_s:.0f}s "
-                    f"(pending={pending_count}/{len(handles)}, "
-                    f"last_chunk={is_last_chunk}); cancelled in-flight "
-                    f"transfers and failed the request."
-                )
             time.sleep(0)
 
-    def _release_done_xfer_handles(self, handles: List[Any], room: int) -> None:
-        """Free NIXL transfer handles that reached DONE.
+    def _release_xfer_handles(self, handles: List[Any], room: int) -> None:
+        """Free NIXL transfer handles that reached a terminal state.
 
         The backend keeps per-transfer state (chunk requests, CUDA streams and
         the pending-transfer registration) alive until the handle is released;
@@ -1580,16 +1650,19 @@ class NixlKVManager(CommonKVManager):
         for handle in handles:
             try:
                 if self.agent.check_xfer_state(handle) == "DONE":
-                    self._release_done_xfer_handles([handle], room)
+                    self._release_xfer_handles([handle], room)
                     continue
             except Exception as exc:
-                if _is_nixl_remote_gone_error(exc):
+                if _is_nixl_remote_gone_error(exc) or _is_nixl_transport_deadline_error(
+                    exc
+                ):
                     logger.warning(
                         "[STAGING_HANDLE_PEER_GONE] room=%s handle=%s; "
                         "source buffer is safe to reuse",
                         room,
                         handle,
                     )
+                    self._release_xfer_handles([handle], room)
                     continue
                 uncancelled.append(handle)
                 logger.exception(
@@ -1772,6 +1845,7 @@ class NixlKVManager(CommonKVManager):
                 raise Exception("KVSender failed to create prepped transfer")
             state = self.agent.transfer(xfer_handle)
             if state == "ERR":
+                self._release_xfer_handles([xfer_handle], -1)
                 raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
 
@@ -1882,6 +1956,7 @@ class NixlKVManager(CommonKVManager):
             raise Exception("KVSender failed to create transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
+            self._release_xfer_handles([xfer_handle], -1)
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
@@ -1945,6 +2020,7 @@ class NixlKVManager(CommonKVManager):
                 raise Exception("KVSender failed to create mixed prepped transfer")
             state = self.agent.transfer(xfer_handle)
             if state == "ERR":
+                self._release_xfer_handles([xfer_handle], -1)
                 raise Exception("KVSender failed to post mixed prepped transfer")
             handles.append(xfer_handle)
         return handles
@@ -1992,6 +2068,7 @@ class NixlKVManager(CommonKVManager):
             raise Exception("KVSender failed to create prepped slice transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
+            self._release_xfer_handles([xfer_handle], -1)
             raise Exception("KVSender failed to post prepped slice transfer")
         return xfer_handle
 

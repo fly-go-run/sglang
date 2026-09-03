@@ -145,14 +145,14 @@ class TestStagingPendingAlloc(CustomTestCase):
             self.assertEqual(_rsp_messages(r), [])
         # Room 1 finishes: its extent goes to room 2 (FIFO), room 3 keeps waiting.
         alloc_id = r1.chunk_staging_infos[0][0]
-        handler._free_allocation(alloc_id, handler._room_to_decode_req[1])
+        handler.release_allocation(alloc_id, handler._room_to_decode_req[1])
         self.assertEqual(handler._room_lifecycles[2].chunk_states[0], "WRITABLE")
         self.assertEqual(r2.chunk_staging_infos[0][2], 0)
         self.assertEqual(len(_rsp_messages(r2)), 1)
         self.assertEqual(_rsp_messages(r2)[0][4], b"0")
         self.assertEqual(handler._room_lifecycles[3].chunk_states[0], "PENDING_ALLOC")
         self.assertEqual(handler.pending_alloc_count(), 1)
-        handler._free_allocation(
+        handler.release_allocation(
             r2.chunk_staging_infos[0][0], handler._room_to_decode_req[2]
         )
         self.assertEqual(handler._room_lifecycles[3].chunk_states[0], "WRITABLE")
@@ -175,13 +175,13 @@ class TestStagingPendingAlloc(CustomTestCase):
         _req(handler, rb, 3, pages=8)  # needs 2 * size, queued first
         r4 = _req(handler, rb, 4)  # needs size, queued behind it
         self.assertEqual(handler.pending_alloc_count(), 2)
-        handler._free_allocation(
+        handler.release_allocation(
             r1.chunk_staging_infos[0][0], handler._room_to_decode_req[1]
         )
         # One chunk freed: room 3 still does not fit, and room 4 must not jump it.
         self.assertEqual(handler._room_lifecycles[3].chunk_states[0], "PENDING_ALLOC")
         self.assertEqual(handler._room_lifecycles[4].chunk_states[0], "PENDING_ALLOC")
-        handler._free_allocation(
+        handler.release_allocation(
             r2.chunk_staging_infos[0][0], handler._room_to_decode_req[2]
         )
         self.assertEqual(handler._room_lifecycles[3].chunk_states[0], "WRITABLE")
@@ -195,7 +195,7 @@ class TestStagingPendingAlloc(CustomTestCase):
         r2 = _req(handler, rb, 2)
         handler._terminalize_room(2, "staging-stall")
         self.assertEqual(handler.pending_alloc_count(), 0)
-        handler._free_allocation(
+        handler.release_allocation(
             r1.chunk_staging_infos[0][0], handler._room_to_decode_req[1]
         )
         self.assertEqual(_rsp_messages(r2), [])
@@ -213,6 +213,84 @@ class TestStagingPendingAlloc(CustomTestCase):
         self.assertEqual(len(msgs), 1)
         self.assertEqual(msgs[0][3], str(StagingAllocator.ALLOC_OVERSIZED).encode())
         self.assertEqual(handler.pending_alloc_count(), 0)
+
+
+    def test_release_under_room_lock_services_same_room_head(self):
+        # Regression: freeing under a room's lifecycle lock used to service the
+        # queue inline; with that room at the queue head the non-reentrant lock
+        # deadlocked. Servicing now happens after the lock is dropped.
+        size = _chunk_bytes()
+        handler, rb = _handler(_allocator(size), [1])
+        r1 = _req(handler, rb, 1, chunk_idx=0)
+        _req(handler, rb, 1, chunk_idx=1)
+        self.assertEqual(handler._room_lifecycles[1].chunk_states[1], "PENDING_ALLOC")
+        done = threading.Event()
+
+        def release():
+            handler.release_unwritten_chunks(1)
+            done.set()
+
+        worker = threading.Thread(target=release, daemon=True)
+        worker.start()
+        self.assertTrue(done.wait(5.0), "release_unwritten_chunks deadlocked")
+        self.assertEqual(handler._room_lifecycles[1].chunk_states[1], "WRITABLE")
+        self.assertEqual(handler.pending_alloc_count(), 0)
+        self.assertEqual(len(_rsp_messages(r1)), 2)
+
+    def test_unattainable_queued_request_fails_room_instead_of_blocking(self):
+        size = _chunk_bytes()
+        handler, rb = _handler(_allocator(2 * size), [1, 2, 3])
+        _req(handler, rb, 1)
+        _req(handler, rb, 2)
+        # Room 3 needs two chunks' worth; attainable now, so it queues.
+        _req(handler, rb, 3, pages=8)
+        self.assertEqual(handler.pending_alloc_count(), 1)
+        alloc1 = handler._room_to_receiver[1].chunk_staging_infos[0][0]
+        alloc2 = handler._room_to_receiver[2].chunk_staging_infos[0][0]
+        self.assertTrue(handler.staging_allocator.quarantine(alloc1, "test"))
+        # A release services the queue: room 3 can never fit any more.
+        handler.release_allocation(alloc2, handler._room_to_decode_req[2])
+        self.assertEqual(handler.pending_alloc_count(), 0)
+        handler.fail_staging_room.assert_called_once()
+        self.assertEqual(handler.fail_staging_room.call_args.args[0], 3)
+        self.assertIn(
+            "STAGING_ALLOC_UNATTAINABLE", handler.fail_staging_room.call_args.args[1]
+        )
+
+    def test_oversized_uses_attainable_extent_not_pool_total(self):
+        size = _chunk_bytes()
+        handler, rb = _handler(_allocator(2 * size), [1, 2])
+        _req(handler, rb, 1)
+        alloc1 = handler._room_to_receiver[1].chunk_staging_infos[0][0]
+        self.assertTrue(handler.staging_allocator.quarantine(alloc1, "test"))
+        self.assertEqual(handler.staging_allocator.max_attainable_extent(), size)
+        r2 = _req(handler, rb, 2, pages=8)
+        self.assertEqual(handler._room_lifecycles[2].chunk_states[0], "OVERSIZED")
+        self.assertEqual(handler.pending_alloc_count(), 0)
+        msgs = _rsp_messages(r2)
+        self.assertEqual(len(msgs), 1)
+
+    def test_enqueue_race_is_closed_by_servicing_after_enqueue(self):
+        # The pool looks full when the request is checked, but a release lands
+        # before the request is enqueued. Servicing right after the enqueue must
+        # grant it instead of leaving it queued until the next release.
+        size = _chunk_bytes()
+        handler, rb = _handler(_allocator(size), [1])
+        allocator = handler.staging_allocator
+        real_assign = allocator.assign
+        calls = {"n": 0}
+
+        def assign_full_once(required):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return real_assign(required)
+
+        allocator.assign = assign_full_once
+        r1 = _req(handler, rb, 1)
+        self.assertEqual(handler._room_lifecycles[1].chunk_states[0], "WRITABLE")
+        self.assertEqual(handler.pending_alloc_count(), 0)
+        self.assertEqual(len(_rsp_messages(r1)), 1)
 
 
 if __name__ == "__main__":

@@ -211,6 +211,9 @@ class DecodeStagingHandler:
         Stops at the first request that still does not fit so a large chunk is
         never starved by smaller ones queued behind it.
         """
+        # Handlers built without __init__ (unit fixtures) have no queue.
+        if not getattr(self, "_pending_allocs", None):
+            return
         while True:
             with self._pending_lock:
                 if not self._pending_allocs:
@@ -221,10 +224,29 @@ class DecodeStagingHandler:
                 if lifecycle is None or receiver is None or lifecycle.terminal:
                     self._pending_allocs.popleft()
                     continue
-                result = self.staging_allocator.assign(required)
-                if result is None:
-                    return
-                self._pending_allocs.popleft()
+                attainable = self.staging_allocator.max_attainable_extent()
+                if required > attainable:
+                    # A quarantine after this request was queued shrank the
+                    # widest attainable extent below it: it can never be
+                    # granted and must not block the queue head.
+                    self._pending_allocs.popleft()
+                    unattainable = (room, chunk_idx, required, attainable)
+                    result = None
+                else:
+                    unattainable = None
+                    result = self.staging_allocator.assign(required)
+                    if result is None:
+                        return
+                    self._pending_allocs.popleft()
+            if unattainable is not None:
+                room, chunk_idx, required, attainable = unattainable
+                self.fail_staging_room(
+                    room,
+                    f"[STAGING_ALLOC_UNATTAINABLE] room={room} chunk={chunk_idx} "
+                    f"needs {required} bytes but the largest attainable extent "
+                    f"is {attainable} bytes after quarantine",
+                )
+                continue
             alloc_id, offset, _ = result
             granted = False
             with lifecycle.lock:
@@ -869,6 +891,7 @@ class DecodeStagingHandler:
         receiver = self._room_to_receiver.get(room)
         if lifecycle is None or decode_req is None or receiver is None:
             return
+        freed = False
         with lifecycle.lock:
             if lifecycle.terminal:
                 return
@@ -881,7 +904,9 @@ class DecodeStagingHandler:
                     continue
                 lifecycle.chunk_states[chunk_idx] = "SCATTER_DONE"
                 chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
-                self._free_allocation(alloc_id, decode_req)
+                freed |= self._free_allocation(alloc_id, decode_req)
+        if freed:
+            self._service_pending_allocs()
 
     # ------------------------------------------------------------------
     # Event check + free: called from main thread (pop_transferred)
@@ -903,6 +928,7 @@ class DecodeStagingHandler:
         if lifecycle is None:
             return
         chunk_events = decode_req._chunk_events
+        freed = False
         if chunk_events:
             for i in range(len(chunk_events) - 1, -1, -1):
                 event, alloc_id, chunk_idx = chunk_events[i]
@@ -923,7 +949,10 @@ class DecodeStagingHandler:
                         ):
                             chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
                         if not lifecycle.terminal:
-                            self._free_allocation(alloc_id, decode_req)
+                            freed |= self._free_allocation(alloc_id, decode_req)
+        if freed:
+            # Outside lifecycle.lock: the queue head may be this very room.
+            self._service_pending_allocs()
 
         # Resource-driven completion (same model as upstream #30545): all
         # ranks reported Success, every scatter event fired, and no staging
@@ -1132,11 +1161,22 @@ class DecodeStagingHandler:
         if receiver is not None:
             receiver.conclude_state = KVPoll.Failed
 
-    def _free_allocation(self, alloc_id: int, decode_req: DecodeRequest) -> None:
-        """Release an extent and grant queued STAGING_REQs that now fit."""
-        if not self.staging_allocator.free(alloc_id):
-            return
-        self._service_pending_allocs()
+    def _free_allocation(self, alloc_id: int, decode_req: DecodeRequest) -> bool:
+        """Release an extent. Returns True if it was freed.
+
+        Callers hold a room's lifecycle lock here; servicing the pending queue
+        takes the head room's lifecycle lock, so it must run after the caller
+        drops its own lock (see advance_scatter / release_unwritten_chunks).
+        """
+        return self.staging_allocator.free(alloc_id)
+
+    def release_allocation(self, alloc_id: int, decode_req: DecodeRequest) -> bool:
+        """Free an extent and service the pending queue. Only for callers that
+        hold no lifecycle lock."""
+        freed = self._free_allocation(alloc_id, decode_req)
+        if freed:
+            self._service_pending_allocs()
+        return freed
 
 
 def is_watermark_ready(
@@ -1534,14 +1574,17 @@ def handle_staging_req(
         elif violation is None:
             while len(infos) <= chunk_idx:
                 infos.append((-1, -1, 0, -1, 0))
-            if required > staging_allocator.total_size:
+            attainable = staging_allocator.max_attainable_extent()
+            if required > attainable:
                 logger.error(
                     "[STAGING_REQ] chunk exceeds the staging pool room=%s chunk=%d "
-                    "(need %d bytes, pool total=%d bytes). Increase "
-                    "SGLANG_DISAGG_STAGING_POOL_SIZE_MB.",
+                    "(need %d bytes, largest attainable extent=%d bytes, pool "
+                    "total=%d bytes). Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB "
+                    "or restart if quarantine has fragmented the pool.",
                     room,
                     chunk_idx,
                     required,
+                    attainable,
                     staging_allocator.total_size,
                 )
                 offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
@@ -1576,6 +1619,10 @@ def handle_staging_req(
         staging_handler.enqueue_pending_alloc(
             room, chunk_idx, required, session_id, chunk_num_pages
         )
+        # A release between the failed assign above and the enqueue would have
+        # found an empty queue; service once more so that extent is not idle
+        # until the next release.
+        staging_handler._service_pending_allocs()
         return
     send_staging_rsp(
         receiver, room_bootstrap, room, chunk_idx, offset, rnd, end, session_id
@@ -1613,6 +1660,43 @@ def send_staging_rsp(
                 )
         except Exception:
             pass
+
+
+def send_staging_fail(
+    room: int, transfer_infos: dict, prefetch_sockets: dict, reason: str
+) -> int:
+    """Tell every decode peer of ``room`` that the prefill side failed it.
+
+    Without this the decode only learns about a prefill transfer failure from
+    its own waiting timeout (Dynamo consumes the prefill stream in the
+    background and never cancels the decode request). Returns the number of
+    peers notified. Best effort: a peer that cannot be reached is skipped.
+    """
+    import zmq
+    from sglang.srt.utils.network import NetworkAddress
+
+    notified = 0
+    for tinfo in (transfer_infos.get(room) or {}).values():
+        try:
+            na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
+            ep = na.to_tcp()
+            if ep not in prefetch_sockets:
+                sock = zmq.Context().socket(zmq.PUSH)
+                if na.is_ipv6:
+                    sock.setsockopt(zmq.IPV6, 1)
+                sock.connect(ep)
+                prefetch_sockets[ep] = sock
+            prefetch_sockets[ep].send_multipart(
+                [
+                    b"STAGING_FAIL",
+                    str(room).encode("ascii"),
+                    reason.encode("utf-8", errors="replace")[:512],
+                ]
+            )
+            notified += 1
+        except Exception:
+            logger.exception("[STAGING_FAIL] could not notify decode for room=%s", room)
+    return notified
 
 
 def prefetch_staging_reqs(

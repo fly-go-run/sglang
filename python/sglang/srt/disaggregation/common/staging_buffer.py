@@ -348,6 +348,26 @@ class StagingAllocator:
         with self.lock:
             return max((size for _, size in self.free_extents), default=0)
 
+    def max_attainable_extent(self) -> int:
+        """Largest extent that could ever be granted.
+
+        Quarantined allocations are permanent walls; a request larger than the
+        widest gap between them can never be satisfied and must be answered
+        OVERSIZED instead of queued forever.
+        """
+        with self.lock:
+            walls = sorted(
+                (self.allocations[a][0], self.allocations[a][1])
+                for a in self.quarantined_allocations
+                if a in self.allocations
+            )
+            best = 0
+            cursor = 0
+            for offset, size in walls:
+                best = max(best, offset - cursor)
+                cursor = max(cursor, offset + size)
+            return max(best, self.total_size - cursor)
+
     def get_watermark(self) -> Tuple[int, int]:
         """Compatibility: extents are exclusive from grant, so there is no
         watermark. Round 0 tells prefill it never has to wait."""
