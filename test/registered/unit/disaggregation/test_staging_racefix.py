@@ -71,10 +71,15 @@ class TestStagingRaceFix(CustomTestCase):
             chunk_staging_infos=[(17, 256, 0, 512, expected_pages)],
         )
         decode_req = SimpleNamespace(
+            req=SimpleNamespace(bootstrap_room=19),
             kv_receiver=receiver,
             _staging_progress_lock=threading.Lock(),
             _staging_stall_failed=False,
             _staging_stall_since=None,
+            _staging_data_started=True,
+            _staging_scatter_done=False,
+            _staging_all_success=False,
+            _staging_success_ts=0.0,
             _chunk_events=[],
         )
         lifecycle = StagingRoomLifecycle(
@@ -85,6 +90,7 @@ class TestStagingRaceFix(CustomTestCase):
         handler._room_to_receiver = {19: receiver}
         handler._room_lifecycles = {19: lifecycle}
         handler._scatter_region = MagicMock(return_value=True)
+        handler._free_and_send_watermark = MagicMock()
         handler.fail_staging_room = MagicMock()
         counts = defaultdict(lambda: defaultdict(set))
         return handler, lifecycle, counts
@@ -413,11 +419,19 @@ class TestStagingRaceFix(CustomTestCase):
             handler.handle_chunk_arrived(19, 0, 568, 331, 0, "peer", counts),
             (True, False),
         )
-        self.assertFalse(handler.submit_last_scatter_async(19))
-
-        self.assertTrue(lifecycle.terminal)
-        handler.fail_staging_room.assert_called_once()
+        # All-ranks Success only records the transport-level fact; the hole
+        # keeps the allocation live, so the room stays open (the stall
+        # watchdog owns it from here) and nothing is scattered.
+        decode_req = handler._room_to_decode_req[19]
+        self.assertTrue(handler.submit_last_scatter_async(19))
+        self.assertTrue(decode_req._staging_all_success)
+        handler.advance_scatter(decode_req)
+        self.assertFalse(decode_req._staging_scatter_done)
+        self.assertFalse(handler.is_done(decode_req))
+        self.assertFalse(lifecycle.terminal)
+        handler.fail_staging_room.assert_not_called()
         handler._scatter_region.assert_not_called()
+        handler._free_and_send_watermark.assert_not_called()
 
     def test_terminal_last_scatter_does_not_dereference_cleared_receiver(self):
         handler, lifecycle, _counts = self._make_coverage_handler()
@@ -440,6 +454,8 @@ class TestStagingRaceFix(CustomTestCase):
             _staging_progress_lock=threading.Lock(),
             _staging_stall_failed=False,
             _staging_stall_since=None,
+            _staging_all_success=False,
+            _staging_success_ts=0.0,
         )
         handler._room_to_decode_req = {4: decode_req}
         handler._room_lifecycles = {
@@ -457,10 +473,11 @@ class TestStagingRaceFix(CustomTestCase):
         )
         handler.submit_chunk_scatter.assert_called_once_with(4, 0, 0, 2)
         handler.submit_chunk_scatter.reset_mock()
+        # Mooncake still calls this on all-ranks Success; it only records the
+        # fact and never submits a second scatter for the same chunk.
         self.assertTrue(handler.submit_last_scatter_async(4))
-        handler.submit_chunk_scatter.assert_called_once_with(
-            4, 0, 0, 2, is_last_chunk=True
-        )
+        self.assertTrue(decode_req._staging_all_success)
+        handler.submit_chunk_scatter.assert_not_called()
 
     def test_late_staging_req_after_scatter_is_rejected(self):
         allocator = _cpu_allocator()

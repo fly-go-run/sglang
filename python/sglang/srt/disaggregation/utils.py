@@ -185,15 +185,57 @@ def poll_and_all_reduce_with_staging(
     # allow test injection of failure probability at runtime
     receivers = [dr.kv_receiver for dr in decode_reqs]
     raw_polls = _poll_with_failure_injection(receivers)
+    staging_demoted = [False] * len(decode_reqs)
     for i, decode_req in enumerate(decode_reqs):
         if raw_polls[i] == int(KVPoll.Success):
             if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
                 decode_req
             ):
-                raw_polls[i] = int(KVPoll.Transferring)
+                # Raw Success means the transport delivered every chunk. Record
+                # all-ranks Success from this authoritative observation rather
+                # than from notification order: the notification-path trigger
+                # only fires on is_last/aux tags, and when the non-last chunk
+                # is the final one to land nobody would record it.
+                if not getattr(decode_req, "_staging_all_success", False):
+                    staging_handler.submit_last_scatter_async(
+                        decode_req.req.bootstrap_room
+                    )
+                    staging_handler.advance_scatter(decode_req)
+                if not staging_handler.is_done(decode_req):
+                    raw_polls[i] = int(KVPoll.Transferring)
+                    staging_demoted[i] = True
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    metadata_demoted = [False] * len(decode_reqs)
     if metadata_buffers is not None and server_args is not None:
+        before_gate = list(raw_polls)
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
+        for i in range(len(decode_reqs)):
+            metadata_demoted[i] = before_gate[i] == int(KVPoll.Success) and raw_polls[
+                i
+            ] == int(KVPoll.Transferring)
+    # Both gates are re-evaluated every poll but have no timeout of their own,
+    # and the receiver stops running its waiting timeout once it has cached
+    # Success. Bound the demoted state so a gate that never releases fails the
+    # request instead of parking it in the transfer queue forever.
+    for i, decode_req in enumerate(decode_reqs):
+        if not (staging_demoted[i] or metadata_demoted[i]):
+            if getattr(decode_req, "_staging_demoted_since", None) is not None:
+                decode_req._staging_demoted_since = None
+            continue
+        metadata_room = None
+        metadata_index = getattr(decode_req, "metadata_buffer_index", -1)
+        if metadata_buffers is not None and metadata_index is not None:
+            if metadata_index >= 0:
+                try:
+                    metadata_room = int(
+                        metadata_buffers.bootstrap_room[metadata_index, 0].item()
+                    )
+                except Exception:
+                    metadata_room = None
+        if staging_handler.check_demoted_timeout(
+            decode_req, staging_demoted[i], metadata_demoted[i], metadata_room
+        ):
+            raw_polls[i] = int(KVPoll.Failed)
     poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
     return poll_tensor.tolist()

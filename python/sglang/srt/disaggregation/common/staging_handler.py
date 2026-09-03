@@ -50,6 +50,21 @@ STAGING_SCATTER_DRAIN_TIMEOUT_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_SCATTER_DRAIN_TIMEOUT_S", "5")
 )
 
+# A room whose NIXL transfer already concluded Success can still be held in
+# Transferring by a completion gate: the staging scatter is not marked done, or
+# the metadata bootstrap_room stamp has not landed. Once the receiver caches
+# Success it never re-runs its waiting timeout, and the stall watchdog above
+# only runs while ring allocations are held, so a gate that never releases
+# parks the request in the transfer queue forever (observed 2026-09-03: 68
+# requests left in #transfer-req with no log line, never aborted by the
+# frontend because no first response ever reached it). Bound that state here.
+# The clock only runs while the room holds no allocations, so it never overlaps
+# the stall watchdog or its quarantine path; failing the room routes it through
+# the existing Failed -> pop_transferred -> release path with an error reply.
+STAGING_DEMOTED_TIMEOUT_S = float(
+    os.environ.get("SGLANG_DISAGG_STAGING_DEMOTED_TIMEOUT_S", "60")
+)
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -66,7 +81,6 @@ class DecodeStagingContext:
     allocator: object = None
     room_bootstrap: dict = dataclasses.field(default_factory=dict)
     room_receivers: dict = dataclasses.field(default_factory=dict)
-    requires_last_writer_slots: bool = False
 
 
 @dataclasses.dataclass
@@ -129,7 +143,6 @@ class DecodeStagingHandler:
         tp_rank: int,
         scheduler,
         fatal_shutdown=None,
-        requires_last_writer_slots: bool = False,
     ):
         self.kv_manager = kv_manager
         self.staging_allocator = staging_allocator
@@ -139,7 +152,6 @@ class DecodeStagingHandler:
         self.tp_rank = tp_rank
         self.scheduler = scheduler
         self._fatal_shutdown = fatal_shutdown
-        self._requires_last_writer_slots = requires_last_writer_slots
         self._room_to_decode_req: dict = {}
         # Failure paths clear decode_req.kv_receiver before unregistering the
         # room, so retain the receiver needed to release staging allocations.
@@ -451,9 +463,6 @@ class DecodeStagingHandler:
             fatal_shutdown=getattr(
                 kv_manager, "_request_fatal_transfer_shutdown", None
             ),
-            requires_last_writer_slots=(
-                kv_manager._staging_ctx.requires_last_writer_slots
-            ),
         )
 
     # ------------------------------------------------------------------
@@ -526,9 +535,6 @@ class DecodeStagingHandler:
         }
         for item in getattr(decode_req, "_chunk_events", []):
             alloc_ids.add(item[1])
-        last_alloc_id = getattr(decode_req, "_scatter_alloc_id", -1)
-        if last_alloc_id >= 0:
-            alloc_ids.add(last_alloc_id)
         return {
             alloc_id
             for alloc_id in alloc_ids
@@ -607,12 +613,13 @@ class DecodeStagingHandler:
             receiver.conclude_state = KVPoll.Failed
 
     def register_decode_req(self, room: int, decode_req: DecodeRequest) -> None:
+        # Completion is resource-driven (same model as upstream #30545): the
+        # room is done once every rank reported Success, every scatter event
+        # fired, and no staging allocation is still live. No chunk is special.
         decode_req._staging_scatter_done = False
+        decode_req._staging_all_success = False
+        decode_req._staging_success_ts = 0.0
         decode_req._chunk_events = []
-        decode_req._staging_last_scatter_submitted = False
-        decode_req._scatter_event = None
-        decode_req._scatter_alloc_id = -1
-        decode_req._scatter_chunk_idx = -1
         # Stall clock: None means "no allocations held / progress just made".
         # It starts counting only after the first accepted writer notification,
         # and is reset by every later progress event (chunk arrival, scatter
@@ -623,6 +630,9 @@ class DecodeStagingHandler:
         decode_req._staging_data_started = False
         decode_req._staging_stall_since = None
         decode_req._staging_stall_failed = False
+        # Demoted clock: set when raw poll is Success but a completion gate
+        # keeps the room in Transferring while it holds no allocations.
+        decode_req._staging_demoted_since = None
         self._room_lifecycles[room] = StagingRoomLifecycle()
         self._room_to_decode_req[room] = decode_req
         self._room_to_receiver[room] = decode_req.kv_receiver
@@ -676,12 +686,12 @@ class DecodeStagingHandler:
         chunk_idx: int,
         page_start: int,
         num_pages: int,
-        is_last_chunk: bool = False,
     ) -> bool:
         """Submit scatter after every writer covers the complete chunk.
 
-        Called from decode_thread.  Records a CUDA event on decode_req so
-        the main thread can later check completion and free the allocation.
+        Called from decode_thread. Every chunk, including the request's final
+        one, takes this path and records its CUDA event in ``_chunk_events``;
+        the main thread later checks completion and frees the allocation.
         """
         lifecycle = self._room_lifecycles.get(room)
         if lifecycle is None:
@@ -730,18 +740,6 @@ class DecodeStagingHandler:
                         f"[STAGING_GEOMETRY] missing allocation room={room} "
                         f"chunk={chunk_idx}"
                     )
-                elif self._requires_last_writer_slots and not (
-                    self._chunk_coverage_complete_locked(
-                        lifecycle, chunk_idx, self.num_writers_for(decode_req)
-                    )
-                ):
-                    lifecycle.terminal = True
-                    violation = (
-                        f"[STAGING_COVERAGE] scatter before complete coverage "
-                        f"room={room} chunk={chunk_idx} "
-                        f"expected={expected_geometry} "
-                        f"actual={lifecycle.writer_intervals.get(chunk_idx, {})}"
-                    )
                 else:
                     alloc_id, staging_offset, _, _, allocated_pages = chunk_infos[
                         chunk_idx
@@ -769,15 +767,7 @@ class DecodeStagingHandler:
                         )
                         event = torch.cuda.Event()
                         event.record(self.staging_allocator._scatter_stream)
-                        if is_last_chunk:
-                            decode_req._scatter_event = event
-                            decode_req._scatter_alloc_id = alloc_id
-                            decode_req._scatter_chunk_idx = chunk_idx
-                            decode_req._staging_last_scatter_submitted = True
-                        else:
-                            decode_req._chunk_events.append(
-                                (event, alloc_id, chunk_idx)
-                            )
+                        decode_req._chunk_events.append((event, alloc_id, chunk_idx))
                         return ok
         logger.error(violation)
         self.fail_staging_room(room, violation)
@@ -939,14 +929,20 @@ class DecodeStagingHandler:
         return (False, False)
 
     def submit_last_scatter_async(self, room: int) -> bool:
-        """Submit scatter for the last chunk when all ranks report Success.
+        """Record all-ranks Success for a room.
 
-        Called from decode_thread.  Sets ``_scatter_event`` **before**
-        ``_staging_last_scatter_submitted`` so the main thread sees the
-        event when it checks the flag (CPython GIL guarantees ordering).
+        Scatter is fully arrival-driven: every chunk, including the request's
+        final one, is scattered by handle_chunk_arrived once its writer
+        coverage is complete. This only marks that the transport layer has
+        delivered everything; advance_scatter completes the room once no
+        scatter event is pending and no staging allocation is still live.
+        Deciding completion from "which notification was tagged last" used
+        to leave rooms parked forever when chunked prefill put two logical
+        chunks into one staging chunk (2026-09-03 C512 reproduction).
         """
         lifecycle = self._room_lifecycles.get(room)
-        if lifecycle is None:
+        decode_req = self._room_to_decode_req.get(room)
+        if lifecycle is None or decode_req is None:
             logger.warning(
                 "[STAGING] submit_last_scatter_async: room=%s not registered. "
                 "This should not happen if register_decode_req is called at "
@@ -957,45 +953,39 @@ class DecodeStagingHandler:
         with lifecycle.lock:
             if lifecycle.terminal:
                 return False
-            if not lifecycle.chunk_geometry:
-                decode_req = self._room_to_decode_req.get(room)
-                if decode_req is not None:
-                    decode_req._staging_scatter_done = True
-                    return True
-                return False
-            chunk_idx = max(lifecycle.chunk_geometry)
-            page_start, num_pages = lifecycle.chunk_geometry[chunk_idx]
-            state = lifecycle.chunk_states.get(chunk_idx)
-            if state in ("SCATTER_SUBMITTED", "SCATTER_DONE"):
-                return True
-            decode_req = self._room_to_decode_req.get(room)
-            if decode_req is None:
-                return False
-            if self._requires_last_writer_slots and not (
-                self._chunk_coverage_complete_locked(
-                    lifecycle, chunk_idx, self.num_writers_for(decode_req)
-                )
-            ):
-                lifecycle.terminal = True
-                violation = (
-                    f"[STAGING_COVERAGE] completion with incomplete coverage "
-                    f"room={room} chunk={chunk_idx} "
-                    f"expected={lifecycle.chunk_geometry[chunk_idx]} "
-                    f"actual={lifecycle.writer_intervals.get(chunk_idx, {})}"
-                )
-            else:
-                violation = None
-        if violation is not None:
-            logger.error(violation)
-            self.fail_staging_room(room, violation)
-            return False
-        return self.submit_chunk_scatter(
-            room,
-            chunk_idx,
-            page_start,
-            num_pages,
-            is_last_chunk=True,
-        )
+            if not decode_req._staging_all_success:
+                # Timestamp before flag so a concurrent reader never sees a
+                # set flag with a zero timestamp.
+                decode_req._staging_success_ts = time.monotonic()
+                decode_req._staging_all_success = True
+        return True
+
+    def release_unwritten_chunks(self, room: int) -> None:
+        """Free allocations of chunks that will never receive data.
+
+        Used when every prefill rank reported ``aux_nokv`` (decode-side radix
+        cache hit): STAGING_REQ already allocated ring space for the room, but
+        no writer will ever cover it, so release it and mark the chunks
+        terminal so a late writer is rejected instead of scattered.
+        """
+        lifecycle = self._room_lifecycles.get(room)
+        decode_req = self._room_to_decode_req.get(room)
+        receiver = self._room_to_receiver.get(room)
+        if lifecycle is None or decode_req is None or receiver is None:
+            return
+        with lifecycle.lock:
+            if lifecycle.terminal:
+                return
+            chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+            for chunk_idx, info in enumerate(chunk_infos):
+                alloc_id = info[0]
+                if alloc_id < 0 or lifecycle.writer_intervals.get(chunk_idx):
+                    continue
+                if lifecycle.chunk_states.get(chunk_idx, "WRITABLE") != "WRITABLE":
+                    continue
+                lifecycle.chunk_states[chunk_idx] = "SCATTER_DONE"
+                chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+                self._free_and_send_watermark(alloc_id, decode_req)
 
     # ------------------------------------------------------------------
     # Event check + free: called from main thread (pop_transferred)
@@ -1039,34 +1029,26 @@ class DecodeStagingHandler:
                         if not lifecycle.terminal:
                             self._free_and_send_watermark(alloc_id, decode_req)
 
-        if getattr(decode_req, "_staging_last_scatter_submitted", False):
-            event = getattr(decode_req, "_scatter_event", None)
-            if event is not None and event.query():
-                with lifecycle.lock:
-                    self._note_staging_progress(decode_req)
-                    alloc_id = decode_req._scatter_alloc_id
-                    chunk_idx = decode_req._scatter_chunk_idx
-                    lifecycle.chunk_states[chunk_idx] = "SCATTER_DONE"
-                    receiver = self._room_to_receiver.get(room)
-                    chunk_infos = (
-                        getattr(receiver, "chunk_staging_infos", [])
-                        if receiver is not None
-                        else []
-                    )
-                    if (
-                        chunk_idx < len(chunk_infos)
-                        and chunk_infos[chunk_idx][0] == alloc_id
-                    ):
-                        chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
-                    if not lifecycle.terminal:
-                        self._free_and_send_watermark(alloc_id, decode_req)
-                    decode_req._scatter_event = None
-                    decode_req._scatter_alloc_id = -1
-                    decode_req._scatter_chunk_idx = -1
-                    decode_req._staging_scatter_done = True
+        # Resource-driven completion (same model as upstream #30545): all
+        # ranks reported Success, every scatter event fired, and no staging
+        # allocation is still live. A chunk whose data is still in flight
+        # keeps info[0] >= 0 and therefore keeps the room open.
+        if (
+            decode_req._staging_all_success
+            and not decode_req._staging_scatter_done
+            and not chunk_events
+        ):
+            receiver = self._room_to_receiver.get(room)
+            chunk_infos = (
+                getattr(receiver, "chunk_staging_infos", [])
+                if receiver is not None
+                else []
+            )
+            if not any(info[0] >= 0 for info in chunk_infos):
+                decode_req._staging_scatter_done = True
 
         # Consume completed events before checking the watchdog. Otherwise a
-        # last-scatter event that completes on the timeout boundary can be
+        # scatter event that completes on the timeout boundary can be
         # mistaken for a stalled allocation and fail an already-finished room.
         self._check_room_stall(room, decode_req)
 
@@ -1138,12 +1120,103 @@ class DecodeStagingHandler:
         """True if this room currently pins any staging ring allocation."""
         if decode_req._chunk_events:
             return True
-        if getattr(decode_req, "_scatter_event", None) is not None:
-            return True
         chunk_infos = (
             getattr(receiver, "chunk_staging_infos", []) if receiver is not None else []
         )
         return any(info[0] >= 0 for info in chunk_infos)
+
+    def check_demoted_timeout(
+        self,
+        decode_req: DecodeRequest,
+        staging_demoted: bool,
+        metadata_demoted: bool,
+        metadata_room=None,
+    ) -> bool:
+        """Fail a room parked at raw Success behind a completion gate.
+
+        Runs on the scheduler main thread from poll_and_all_reduce_with_staging
+        after the staging/metadata gates were applied. Returns True when the
+        room was failed here so the caller reports KVPoll.Failed and the
+        existing Failed -> pop_transferred -> release path cleans it up.
+        Rooms that still hold ring allocations are left to _check_room_stall,
+        so this clock and the stall watchdog never run on the same room.
+        """
+        room = decode_req.req.bootstrap_room
+        if not (staging_demoted or metadata_demoted):
+            decode_req._staging_demoted_since = None
+            return False
+        receiver = decode_req.kv_receiver
+        if receiver is None:
+            receiver = self._room_to_receiver.get(room)
+        if self._room_holds_allocations(decode_req, receiver):
+            decode_req._staging_demoted_since = None
+            return False
+        now = time.monotonic()
+        since = getattr(decode_req, "_staging_demoted_since", None)
+        if since is None:
+            decode_req._staging_demoted_since = now
+            return False
+        elapsed = now - since
+        if elapsed <= STAGING_DEMOTED_TIMEOUT_S:
+            return False
+        snapshot = self._demoted_snapshot(room, decode_req, receiver, metadata_room)
+        logger.error(
+            "[STAGING_DEMOTED_TIMEOUT] room=%s raw poll Success but held in "
+            "Transferring for %.0fs (staging_gate=%s metadata_gate=%s) %s; "
+            "failing the request instead of parking it forever.",
+            room,
+            elapsed,
+            staging_demoted,
+            metadata_demoted,
+            snapshot,
+        )
+        from sglang.srt.disaggregation.base.conn import KVPoll
+
+        self.kv_manager.record_failure(
+            room,
+            f"[STAGING_DEMOTED_TIMEOUT] transfer concluded but completion gate "
+            f"never released for {elapsed:.0f}s "
+            f"(staging_gate={staging_demoted} metadata_gate={metadata_demoted})",
+        )
+        self.kv_manager.update_status(room, KVPoll.Failed)
+        if receiver is not None:
+            receiver.conclude_state = KVPoll.Failed
+        decode_req._staging_demoted_since = None
+        return True
+
+    def _demoted_snapshot(self, room: int, decode_req, receiver, metadata_room) -> str:
+        """One-line state dump used to attribute a demoted-timeout failure."""
+        lifecycle = self._room_lifecycles.get(room)
+        status = getattr(self.kv_manager, "transfer_statuses", {}).get(room)
+        received = getattr(status, "received_kvs_per_pp", None) or {}
+        success_ts = getattr(decode_req, "_staging_success_ts", 0.0) or 0.0
+        fields = {
+            "scatter_done": getattr(decode_req, "_staging_scatter_done", None),
+            "all_success": getattr(decode_req, "_staging_all_success", None),
+            "success_age_s": (
+                round(time.monotonic() - success_ts, 1) if success_ts else None
+            ),
+            "chunk_events": len(getattr(decode_req, "_chunk_events", None) or []),
+            "data_started": getattr(decode_req, "_staging_data_started", None),
+            "lifecycle": (
+                None
+                if lifecycle is None
+                else {
+                    "terminal": lifecycle.terminal,
+                    "quarantined": lifecycle.quarantined,
+                    "chunk_states": dict(lifecycle.chunk_states),
+                    "geometry": dict(lifecycle.chunk_geometry),
+                }
+            ),
+            "chunk_infos": list(getattr(receiver, "chunk_staging_infos", None) or []),
+            "require_staging": getattr(receiver, "require_staging", None),
+            "received_aux": getattr(status, "received_aux", None),
+            "expected_kvs": dict(getattr(status, "expected_kvs_per_pp", None) or {}),
+            "received_kvs": {k: sorted(v) for k, v in received.items()},
+            "metadata_index": getattr(decode_req, "metadata_buffer_index", None),
+            "metadata_room": metadata_room,
+        }
+        return " ".join(f"{k}={v}" for k, v in fields.items())
 
     def _note_staging_progress(self, decode_req: DecodeRequest) -> None:
         """Atomically refresh a room's stall clock after real progress."""

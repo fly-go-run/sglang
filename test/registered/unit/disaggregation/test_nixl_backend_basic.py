@@ -875,9 +875,7 @@ class TestNixlStaging(CustomTestCase):
         mgr._request_fatal_transfer_shutdown = MagicMock()
 
         with self.assertRaisesRegex(RuntimeError, "terminal staging transfer error"):
-            mgr._wait_for_xfers(
-                ["handle"], 17, 0, False, staging_transfer=True
-            )
+            mgr._wait_for_xfers(["handle"], 17, 0, False, staging_transfer=True)
 
         mgr._request_fatal_transfer_shutdown.assert_called_once_with(
             17, 1, reason="staging-terminal-error"
@@ -1315,10 +1313,8 @@ class TestDecodeStagingStallGuard(CustomTestCase):
             )
         handler.register_decode_req(17, decode_req)
         decode_req._staging_data_started = True
-        decode_req._scatter_event = event
-        decode_req._scatter_alloc_id = 41
-        decode_req._scatter_chunk_idx = 0
-        decode_req._staging_last_scatter_submitted = True
+        decode_req._chunk_events = [(event, 41, 0)]
+        decode_req._staging_all_success = True
         decode_req._staging_stall_since = 0.0
         handler._room_lifecycles[17].chunk_states[0] = "SCATTER_SUBMITTED"
         handler._free_and_send_watermark = MagicMock()
@@ -1336,7 +1332,7 @@ class TestDecodeStagingStallGuard(CustomTestCase):
 
         self.assertFalse(decode_req._staging_stall_failed)
         self.assertTrue(decode_req._staging_scatter_done)
-        self.assertIsNone(decode_req._scatter_event)
+        self.assertEqual(decode_req._chunk_events, [])
         self.assertEqual(receiver.chunk_staging_infos[-1], (-1, -1, 0, -1, 0))
         handler._free_and_send_watermark.assert_called_once_with(41, decode_req)
         handler.kv_manager.record_failure.assert_not_called()
@@ -1344,8 +1340,7 @@ class TestDecodeStagingStallGuard(CustomTestCase):
     def test_allocation_only_does_not_start_staging_stall(self):
         handler, _receiver, decode_req, _event = self._make_handler_and_request()
         decode_req._staging_data_started = False
-        decode_req._scatter_event = None
-        decode_req._staging_last_scatter_submitted = False
+        decode_req._chunk_events = []
         decode_req._staging_stall_since = 0.0
 
         with patch(
@@ -1360,8 +1355,7 @@ class TestDecodeStagingStallGuard(CustomTestCase):
 
     def test_started_writer_without_followup_progress_still_stalls(self):
         handler, _receiver, decode_req, _event = self._make_handler_and_request()
-        decode_req._scatter_event = None
-        decode_req._staging_last_scatter_submitted = False
+        decode_req._chunk_events = []
         decode_req._staging_stall_since = 0.0
 
         with patch(

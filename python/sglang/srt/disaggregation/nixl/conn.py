@@ -551,7 +551,6 @@ class NixlKVManager(CommonKVManager):
         )
 
         self._staging_ctx = DecodeStagingContext()
-        self._staging_ctx.requires_last_writer_slots = True
         self._init_staging_allocator()
 
     def _init_staging_buffers(self, count: int):
@@ -2852,19 +2851,20 @@ class NixlKVManager(CommonKVManager):
         )
         if not accepted:
             return
+        handler = self._staging_handler
+        # Scatter is arrival-driven: a staging chunk is scattered as soon as
+        # its writer coverage is complete, whichever notification completes
+        # it. The tag's is_last bit only feeds the transport-level chunk
+        # accounting below; room completion is decided from resources in
+        # DecodeStagingHandler.advance_scatter, never from this tag.
+        if coverage_complete and handler is not None:
+            geometry = handler.get_chunk_geometry(room, chunk_idx)
+            if geometry is not None:
+                handler.submit_chunk_scatter(room, chunk_idx, *geometry)
         # Completion accounting is intentionally after geometry/writer
-        # validation and persistent deduplication.
+        # validation and persistent deduplication, and after the scatter
+        # submission so all-ranks Success never precedes the chunk's event.
         self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
-        if coverage_complete and self._staging_handler is not None:
-            geometry = self._staging_handler.get_chunk_geometry(room, chunk_idx)
-            if geometry is None:
-                return
-            self._staging_handler.submit_chunk_scatter(
-                room,
-                chunk_idx,
-                *geometry,
-                is_last_chunk=is_last_chunk,
-            )
 
     def _handle_aux_notification(self, room: int, components: List[str]):
         """Handle an aux notification and trigger last scatter if staging is complete.
@@ -2879,7 +2879,23 @@ class NixlKVManager(CommonKVManager):
         # main's "nokv" marker (decode-side radix cache hit, see #19746).
         if len(components) > 3 and components[2] == "nokv":
             pp_rank = int(components[3])
-            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = 0
+            status = self.transfer_statuses[room]
+            status.expected_kvs_per_pp[pp_rank] = 0
+            handler = self._staging_handler
+            expected_ranks = (
+                status.num_pp_ranks_expected
+                or self.required_prefill_response_num_table.get(room, 1)
+            )
+            if (
+                self.enable_staging
+                and handler is not None
+                and handler.is_staging_room(room)
+                and len(status.expected_kvs_per_pp) >= expected_ranks
+                and all(v == 0 for v in status.expected_kvs_per_pp.values())
+            ):
+                # No rank will write anything: release the ring space that the
+                # prefetched STAGING_REQs allocated so the room can complete.
+                handler.release_unwritten_chunks(room)
         if self.transfer_statuses[room].num_pp_ranks_expected is None:
             self.transfer_statuses[room].num_pp_ranks_expected = (
                 self.required_prefill_response_num_table.get(room, 1)
