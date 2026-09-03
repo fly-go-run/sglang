@@ -1396,6 +1396,7 @@ class NixlKVManager(CommonKVManager):
                                 room, kv_chunk.chunk_id, req.agent_name
                             )
                         raise
+                    self._release_done_xfer_handles(req_handles, room)
                     if staging_handled:
                         self._mark_staging_send_done(
                             room, kv_chunk.chunk_id, req.agent_name
@@ -1551,6 +1552,23 @@ class NixlKVManager(CommonKVManager):
                 )
             time.sleep(0)
 
+    def _release_done_xfer_handles(self, handles: List[Any], room: int) -> None:
+        """Free NIXL transfer handles that reached DONE.
+
+        The backend keeps per-transfer state (chunk requests, CUDA streams and
+        the pending-transfer registration) alive until the handle is released;
+        every completed transfer leaked that state before this call existed.
+        """
+        for handle in handles:
+            try:
+                self.agent.release_xfer_handle(handle)
+            except Exception:
+                logger.exception(
+                    "[STAGING_HANDLE_RELEASE] release failed room=%s handle=%s",
+                    room,
+                    handle,
+                )
+
     def _cancel_pending_xfers(self, handles: List[Any], room: int) -> List[Any]:
         """Cancel active NIXL handles and return those still unsafe to reuse.
 
@@ -1562,6 +1580,7 @@ class NixlKVManager(CommonKVManager):
         for handle in handles:
             try:
                 if self.agent.check_xfer_state(handle) == "DONE":
+                    self._release_done_xfer_handles([handle], room)
                     continue
             except Exception as exc:
                 if _is_nixl_remote_gone_error(exc):

@@ -828,9 +828,15 @@ class TestNixlStaging(CustomTestCase):
         )
 
         self.assertEqual(uncancelled, ["active"])
+        # DONE handles are released too (their backend state would leak
+        # otherwise); only the ones that stay active are reported back.
         self.assertEqual(
             agent.release_xfer_handle.call_args_list,
-            [unittest.mock.call("cancelled"), unittest.mock.call("active")],
+            [
+                unittest.mock.call("done"),
+                unittest.mock.call("cancelled"),
+                unittest.mock.call("active"),
+            ],
         )
 
     def test_timed_out_xfer_with_successful_cancel_does_not_fail_stop(self):
