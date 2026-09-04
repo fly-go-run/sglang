@@ -46,6 +46,18 @@ STAGING_ROOM_STALL_TIMEOUT_S = float(
 STAGING_SCATTER_DRAIN_TIMEOUT_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_SCATTER_DRAIN_TIMEOUT_S", "5")
 )
+# Deferred reclaim of a failed room's staging extents (see
+# fail_staging_room_from_peer). Once every writer rank reported its failure
+# (it cancelled its transfers) or the writer's node is gone, the extents are
+# freed after a short delay that covers an H2D copy already in flight. If some
+# writer never reports, the extents are quarantined after the grace period
+# (must exceed the transport ACK deadline: 5 s x 5 attempts = 25 s).
+STAGING_DEFERRED_FREE_DELAY_S = float(
+    os.environ.get("SGLANG_DISAGG_STAGING_DEFERRED_FREE_DELAY_S", "5")
+)
+STAGING_DEFERRED_QUARANTINE_S = float(
+    os.environ.get("SGLANG_DISAGG_STAGING_DEFERRED_QUARANTINE_S", "30")
+)
 
 # Quarantine isolates ring memory whose writer cannot be proven stopped; that
 # alone is safe, so a quarantine caused by a stall, a failed transfer or a
@@ -111,10 +123,28 @@ class StagingRoomLifecycle:
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     terminal: bool = False
     quarantined: bool = False
+    # Extents of this room go to the deferred-reclaim table instead of being
+    # quarantined at terminalization (peer-reported failure).
+    deferred: bool = False
     chunk_states: dict = dataclasses.field(default_factory=dict)
     chunk_geometry: dict = dataclasses.field(default_factory=dict)
     seen_writer_slots: dict = dataclasses.field(default_factory=dict)
     writer_intervals: dict = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class _DeferredReclaim:
+    """Extents of a failed room waiting to be freed or quarantined."""
+
+    alloc_ids: set = dataclasses.field(default_factory=set)
+    expected_writers: int = 1
+    prefill_tp: int = 1
+    # Writer slots (see handle_chunk_arrived) that reported they stopped.
+    reported: set = dataclasses.field(default_factory=set)
+    writer_addrs: set = dataclasses.field(default_factory=set)
+    peer_gone: bool = False
+    first_ts: float = 0.0
+    last_ts: float = 0.0
 
 
 class DecodeStagingHandler:
@@ -159,6 +189,8 @@ class DecodeStagingHandler:
         # This is the staging layer's admission control; no watermark exists.
         self._pending_allocs: deque = deque()
         self._pending_lock = threading.Lock()
+        self._deferred_reclaims: dict[int, _DeferredReclaim] = {}
+        self._deferred_lock = threading.Lock()
 
     # Watermark subscriptions no longer exist: a granted extent is exclusive
     # until released, so prefill never waits on decode. Kept as no-ops for the
@@ -179,6 +211,8 @@ class DecodeStagingHandler:
     def enqueue_pending_alloc(
         self, room: int, chunk_idx: int, required: int, session_id: str, pages: int
     ) -> None:
+        # Pool is full: reclaim what failed rooms left behind before queueing.
+        self.sweep_deferred_reclaims()
         with self._pending_lock:
             for item in self._pending_allocs:
                 if item[0] == room and item[1] == chunk_idx:
@@ -459,8 +493,15 @@ class DecodeStagingHandler:
             if alloc_id in self.staging_allocator.allocations
         }
 
-    def _terminalize_room(self, room: int, reason: str) -> set[int]:
-        """Close the scatter/allocation fence, then quarantine live allocations."""
+    def _terminalize_room(
+        self, room: int, reason: str, quarantine: bool = True
+    ) -> set[int]:
+        """Close the scatter/allocation fence, then quarantine live allocations.
+
+        With ``quarantine=False`` (or once the room was already deferred) the
+        live allocations go to the deferred-reclaim table instead; see
+        fail_staging_room_from_peer.
+        """
         lifecycle = self._room_lifecycles.get(room)
         decode_req = self._room_to_decode_req.get(room)
         receiver = self._room_to_receiver.get(room)
@@ -469,14 +510,167 @@ class DecodeStagingHandler:
         self.drop_pending_allocs(room)
         with lifecycle.lock:
             lifecycle.terminal = True
+            if not quarantine:
+                lifecycle.deferred = True
+            deferred = lifecycle.deferred
             alloc_ids = self._outstanding_alloc_ids(decode_req, receiver)
             if alloc_ids:
-                lifecycle.quarantined = True
+                if not deferred:
+                    lifecycle.quarantined = True
                 for chunk_idx in lifecycle.chunk_states:
                     lifecycle.chunk_states[chunk_idx] = "TERMINAL"
-        for alloc_id in alloc_ids:
-            self.staging_allocator.quarantine(alloc_id, reason)
+        if deferred:
+            self._defer_allocations(room, decode_req, alloc_ids)
+        else:
+            for alloc_id in alloc_ids:
+                self.staging_allocator.quarantine(alloc_id, reason)
         return alloc_ids
+
+    # ------------------------------------------------------------------
+    # Deferred reclaim: peer-reported failures
+    # ------------------------------------------------------------------
+
+    def _defer_allocations(self, room: int, decode_req, alloc_ids: set) -> None:
+        now = time.monotonic()
+        with self._deferred_lock:
+            entry = self._deferred_reclaims.get(room)
+            if entry is None:
+                try:
+                    expected = max(1, int(self.num_writers_for(decode_req)))
+                    prefill_tp = max(
+                        1, int(decode_req.kv_receiver.prefill_info.attn_tp_size)
+                    )
+                except Exception:
+                    expected, prefill_tp = 1, 1
+                addrs = set()
+                for info in self.kv_manager._staging_ctx.room_bootstrap.get(room) or []:
+                    try:
+                        addrs.add(f"{info['rank_ip']}:{info['rank_port']}")
+                    except Exception:
+                        pass
+                entry = _DeferredReclaim(
+                    expected_writers=expected,
+                    prefill_tp=prefill_tp,
+                    writer_addrs=addrs,
+                    first_ts=now,
+                    last_ts=now,
+                )
+                self._deferred_reclaims[room] = entry
+            entry.alloc_ids |= set(alloc_ids)
+
+    def fail_staging_room_from_peer(
+        self, room: int, reason: str, agent: str, engine_rank: int = -1
+    ) -> bool:
+        """A prefill rank reported that it failed this room.
+
+        Fence the room and fail the request now, but do not quarantine its
+        extents: the reporting rank cancelled its transfers, so once every
+        writer rank reported (or the writer node is gone) the extents are
+        safe to free. Returns False if the room is unknown here.
+        """
+        lifecycle = self._room_lifecycles.get(room)
+        decode_req = self._room_to_decode_req.get(room)
+        if lifecycle is None or decode_req is None:
+            return False
+        alloc_ids = self._terminalize_room(room, reason, quarantine=False)
+        self.note_peer_failure(room, agent, engine_rank)
+        if alloc_ids:
+            self._drain_scatter_bounded(room)
+        from sglang.srt.disaggregation.base.conn import KVPoll
+
+        self.kv_manager.record_failure(room, reason)
+        self.kv_manager.update_status(room, KVPoll.Failed)
+        receiver = self._room_to_receiver.get(room)
+        if receiver is not None:
+            receiver.conclude_state = KVPoll.Failed
+        self.sweep_deferred_reclaims()
+        return True
+
+    def note_peer_failure(self, room: int, agent: str, engine_rank: int = -1) -> bool:
+        """Record that a writer rank stopped writing this room (it failed or
+        skipped the room's remaining chunks after an abort)."""
+        with self._deferred_lock:
+            entry = self._deferred_reclaims.get(room)
+            if entry is None:
+                return False
+            if engine_rank >= 0:
+                # Same slot mapping as handle_chunk_arrived.
+                slot = (engine_rank % entry.prefill_tp) % entry.expected_writers
+                entry.reported.add(slot)
+            elif agent:
+                entry.reported.add(agent)
+            entry.last_ts = time.monotonic()
+            return True
+
+    def note_peer_gone(self, failed_bootstrap_addr: str) -> int:
+        """A prefill node disconnected: its rooms' extents can never be
+        written again, so mark matching deferred entries reclaimable."""
+        marked = 0
+        with self._deferred_lock:
+            for entry in self._deferred_reclaims.values():
+                if entry.peer_gone or not entry.writer_addrs:
+                    continue
+                if all(
+                    addr.startswith(failed_bootstrap_addr)
+                    for addr in entry.writer_addrs
+                ):
+                    entry.peer_gone = True
+                    entry.last_ts = time.monotonic()
+                    marked += 1
+        return marked
+
+    def deferred_reclaim_count(self) -> int:
+        with self._deferred_lock:
+            return len(self._deferred_reclaims)
+
+    def sweep_deferred_reclaims(self) -> None:
+        """Free extents whose writers all stopped; quarantine the rest after
+        the grace period. Safe from any thread; takes no lifecycle lock."""
+        if not getattr(self, "_deferred_reclaims", None):
+            return
+        now = time.monotonic()
+        to_free = []
+        to_quarantine = []
+        with self._deferred_lock:
+            for room, entry in list(self._deferred_reclaims.items()):
+                stopped = (
+                    entry.peer_gone or len(entry.reported) >= entry.expected_writers
+                )
+                if stopped and now - entry.last_ts >= STAGING_DEFERRED_FREE_DELAY_S:
+                    to_free.append((room, entry))
+                    del self._deferred_reclaims[room]
+                elif now - entry.first_ts >= STAGING_DEFERRED_QUARANTINE_S:
+                    to_quarantine.append((room, entry))
+                    del self._deferred_reclaims[room]
+        freed_any = False
+        for room, entry in to_free:
+            freed = sum(1 for a in entry.alloc_ids if self.staging_allocator.free(a))
+            freed_any |= freed > 0
+            logger.warning(
+                "[STAGING_DEFERRED_RECLAIM] room=%s freed=%d/%d extents "
+                "(writers reported %d/%d peer_gone=%s)",
+                room,
+                freed,
+                len(entry.alloc_ids),
+                len(entry.reported),
+                entry.expected_writers,
+                entry.peer_gone,
+            )
+        for room, entry in to_quarantine:
+            reason = (
+                f"deferred-reclaim-timeout room={room} writers reported "
+                f"{len(entry.reported)}/{entry.expected_writers}"
+            )
+            for a in entry.alloc_ids:
+                self.staging_allocator.quarantine(a, reason)
+            logger.error(
+                "[STAGING_DEFERRED_QUARANTINE] room=%s quarantined=%d extents: %s",
+                room,
+                len(entry.alloc_ids),
+                reason,
+            )
+        if freed_any:
+            self._service_pending_allocs()
 
     def _drain_scatter_bounded(self, room: int) -> None:
         """Wait briefly for claimed scatter without an unbounded synchronize."""
@@ -582,14 +776,20 @@ class DecodeStagingHandler:
         chunk_infos = (
             getattr(receiver, "chunk_staging_infos", []) if receiver is not None else []
         )
+        lifecycle = self._room_lifecycles.get(room)
+        disposition = (
+            "deferred"
+            if lifecycle is not None and lifecycle.deferred
+            else "quarantined"
+        )
         for chunk_idx, info in enumerate(chunk_infos):
             if info[0] >= 0:
                 logger.error(
-                    "[STAGING_RELEASE] room=%s chunk=%s alloc_id=%s "
-                    "reason=quarantined",
+                    "[STAGING_RELEASE] room=%s chunk=%s alloc_id=%s reason=%s",
                     room,
                     chunk_idx,
                     info[0],
+                    disposition,
                 )
                 chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
         decode_req._chunk_events.clear()
@@ -923,6 +1123,7 @@ class DecodeStagingHandler:
         (via submit_chunk_scatter / submit_last_scatter_async).  This
         method only polls the recorded events and releases staging memory.
         """
+        self.sweep_deferred_reclaims()
         room = decode_req.req.bootstrap_room
         lifecycle = self._room_lifecycles.get(room)
         if lifecycle is None:
@@ -1662,8 +1863,38 @@ def send_staging_rsp(
             pass
 
 
+# The prefill->decode PUSH sockets in prefetch_sockets are shared by the
+# scheduler thread (STAGING_REQ prefetch) and the transfer worker threads
+# (STAGING_FAIL). ZMQ sockets are not thread-safe: two concurrent
+# send_multipart calls interleave frames and corrupt both messages.
+_STAGING_SOCKET_LOCK = threading.Lock()
+
+
+def _staging_socket(prefetch_sockets: dict, endpoint: str, dst_port: int):
+    """Return the cached PUSH socket for a decode endpoint (call under
+    _STAGING_SOCKET_LOCK)."""
+    import zmq
+    from sglang.srt.utils.network import NetworkAddress
+
+    na = NetworkAddress(endpoint, dst_port)
+    ep = na.to_tcp()
+    sock = prefetch_sockets.get(ep)
+    if sock is None:
+        sock = zmq.Context().socket(zmq.PUSH)
+        if na.is_ipv6:
+            sock.setsockopt(zmq.IPV6, 1)
+        sock.connect(ep)
+        prefetch_sockets[ep] = sock
+    return sock
+
+
 def send_staging_fail(
-    room: int, transfer_infos: dict, prefetch_sockets: dict, reason: str
+    room: int,
+    transfer_infos: dict,
+    prefetch_sockets: dict,
+    reason: str,
+    agent_name: str = "",
+    engine_rank: int = -1,
 ) -> int:
     """Tell every decode peer of ``room`` that the prefill side failed it.
 
@@ -1672,27 +1903,20 @@ def send_staging_fail(
     background and never cancels the decode request). Returns the number of
     peers notified. Best effort: a peer that cannot be reached is skipped.
     """
-    import zmq
-    from sglang.srt.utils.network import NetworkAddress
-
     notified = 0
     for tinfo in (transfer_infos.get(room) or {}).values():
         try:
-            na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
-            ep = na.to_tcp()
-            if ep not in prefetch_sockets:
-                sock = zmq.Context().socket(zmq.PUSH)
-                if na.is_ipv6:
-                    sock.setsockopt(zmq.IPV6, 1)
-                sock.connect(ep)
-                prefetch_sockets[ep] = sock
-            prefetch_sockets[ep].send_multipart(
-                [
-                    b"STAGING_FAIL",
-                    str(room).encode("ascii"),
-                    reason.encode("utf-8", errors="replace")[:512],
-                ]
-            )
+            with _STAGING_SOCKET_LOCK:
+                sock = _staging_socket(prefetch_sockets, tinfo.endpoint, tinfo.dst_port)
+                sock.send_multipart(
+                    [
+                        b"STAGING_FAIL",
+                        str(room).encode("ascii"),
+                        reason.encode("utf-8", errors="replace")[:512],
+                        agent_name.encode("ascii", errors="replace"),
+                        str(engine_rank).encode("ascii"),
+                    ]
+                )
             notified += 1
         except Exception:
             logger.exception("[STAGING_FAIL] could not notify decode for room=%s", room)
@@ -1743,22 +1967,18 @@ def prefetch_staging_reqs(
             remaining = total_pages - chunk_idx * full_chunk_pages
             chunk_pages = min(full_chunk_pages, remaining)
             try:
-                na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
-                ep = na.to_tcp()
-                if ep not in prefetch_sockets:
-                    sock = zmq.Context().socket(zmq.PUSH)
-                    if na.is_ipv6:
-                        sock.setsockopt(zmq.IPV6, 1)
-                    sock.connect(ep)
-                    prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
-                    [
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ]
-                )
+                with _STAGING_SOCKET_LOCK:
+                    sock = _staging_socket(
+                        prefetch_sockets, tinfo.endpoint, tinfo.dst_port
+                    )
+                    sock.send_multipart(
+                        [
+                            b"STAGING_REQ",
+                            str(room).encode("ascii"),
+                            str(chunk_idx).encode("ascii"),
+                            str(chunk_pages).encode("ascii"),
+                            session_id.encode("ascii"),
+                        ]
+                    )
             except Exception:
                 staging_requested.discard(stg_key)

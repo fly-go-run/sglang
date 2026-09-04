@@ -5,6 +5,7 @@ import struct
 import sys
 import threading
 import types
+import time
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
@@ -103,6 +104,7 @@ class FakeStagingAllocator:
 
     def max_attainable_extent(self):
         return getattr(self, "total_size", 1 << 40)
+
 
 def _fake_staging_buffer_module(mock_gather=None):
     module = types.ModuleType("sglang.srt.disaggregation.common.staging_buffer")
@@ -365,12 +367,59 @@ class TestNixlAbortHandling(CustomTestCase):
         sock = MagicMock()
         ep = NetworkAddress("127.0.0.1", 5555).to_tcp()
         mgr._staging_ctx = SimpleNamespace(prefetch_sockets={ep: sock})
+        mgr.agent = SimpleNamespace(name="prefill-rank0")
+        mgr.kv_args = SimpleNamespace(engine_rank=1)
 
-        mgr._notify_decode_staging_fail(17, "boom")
+        mgr._report_room_stopped(17, "boom")
+        mgr._report_room_stopped(17, "boom again")  # deduplicated per room
 
         sock.send_multipart.assert_called_once_with(
-            [b"STAGING_FAIL", b"17", b"boom"]
+            [b"STAGING_FAIL", b"17", b"boom", b"prefill-rank0", b"1"]
         )
+
+        # The scheduler's failure cleanup may pop transfer_infos before the
+        # worker reports; the cached peer snapshot still reaches decode.
+        mgr._staging_room_peers = {18: dict(mgr.transfer_infos[17])}
+        mgr._staging_fail_reported = {}
+        mgr._report_room_stopped(18, "late")
+        self.assertEqual(sock.send_multipart.call_count, 2)
+        self.assertEqual(sock.send_multipart.call_args.args[0][1], b"18")
+        self.assertNotIn(18, mgr._staging_room_peers)
+
+    def test_staging_socket_sends_are_serialized_across_threads(self):
+        # Transfer workers (STAGING_FAIL) and the scheduler (STAGING_REQ
+        # prefetch) share one PUSH socket per decode; concurrent
+        # send_multipart calls interleave frames on the wire.
+        from sglang.srt.disaggregation.common.staging_handler import (
+            send_staging_fail,
+        )
+        from sglang.srt.utils.network import NetworkAddress
+
+        inside = threading.Event()
+        overlaps = []
+
+        class Sock:
+            def send_multipart(self, frames):
+                if inside.is_set():
+                    overlaps.append(frames)
+                inside.set()
+                time.sleep(0.002)
+                inside.clear()
+
+        ep = NetworkAddress("127.0.0.1", 5555).to_tcp()
+        sockets = {ep: Sock()}
+        infos = {"d": SimpleNamespace(endpoint="127.0.0.1", dst_port=5555)}
+
+        def worker(room):
+            for _ in range(20):
+                send_staging_fail(room, {room: infos}, sockets, "x", "a", 0)
+
+        threads = [threading.Thread(target=worker, args=(r,)) for r in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(overlaps, [])
 
     def test_staging_fail_message_fails_staging_room_immediately(self):
         mgr = self._make_manager({17: KVPoll.WaitingForInput})
@@ -378,11 +427,16 @@ class TestNixlAbortHandling(CustomTestCase):
         handler.is_staging_room.return_value = True
         mgr._staging_handler = handler
 
-        mgr._handle_staging_fail([b"STAGING_FAIL", b"17", b"prefill boom"])
+        mgr._handle_staging_fail(
+            [b"STAGING_FAIL", b"17", b"prefill boom", b"prefill-rank0", b"1"]
+        )
 
-        handler.fail_staging_room.assert_called_once()
-        self.assertEqual(handler.fail_staging_room.call_args.args[0], 17)
-        reason = handler.fail_staging_room.call_args.args[1]
+        handler.fail_staging_room_from_peer.assert_called_once()
+        call = handler.fail_staging_room_from_peer.call_args
+        self.assertEqual(call.args[0], 17)
+        self.assertEqual(call.args[2], "prefill-rank0")
+        self.assertEqual(call.args[3], 1)
+        reason = call.args[1]
         self.assertIn("prefill-transfer-failed", reason)
         # Must not read as a "[STAGING_*]" invariant violation, which would
         # fail-stop the decode on the first prefill-reported failure.
@@ -397,9 +451,15 @@ class TestNixlAbortHandling(CustomTestCase):
 
         self.assertEqual(mgr.request_status[17], KVPoll.Failed)
         self.assertIn("prefill-transfer-failed", mgr.failure_records[17])
-        # Unknown rooms are ignored.
-        mgr._handle_staging_fail([b"STAGING_FAIL", b"99", b"x"])
+        # Unknown rooms are held until registration, then fail immediately.
+        mgr._handle_staging_fail([b"STAGING_FAIL", b"99", b"early", b"rank0"])
         self.assertNotIn(99, mgr.request_status)
+        mgr._staging_ctx = SimpleNamespace(room_bootstrap={}, room_receivers={})
+        receiver = SimpleNamespace(conclude_state=None)
+        mgr.register_staging_room_bootstrap(99, [], receiver)
+        self.assertEqual(mgr.request_status[99], KVPoll.Failed)
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+        self.assertIn("early", mgr.failure_records[99])
 
     def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
         self,

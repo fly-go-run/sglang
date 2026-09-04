@@ -621,6 +621,25 @@ class NixlKVManager(CommonKVManager):
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
+        pending = getattr(self, "_staging_pending_fail", None)
+        if pending and room in pending:
+            reason, agent, _ = pending.pop(room)
+            logger.warning(
+                "[STAGING_PREFILL_FAILED] room=%s failed before registration "
+                "(agent=%s): %s",
+                room,
+                agent,
+                reason[:160],
+            )
+            self.record_failure(room, reason)
+            # The room is being registered right now, so creating its status
+            # entry as Failed is not the "resurrect a cleared room" case that
+            # update_status() refuses.
+            self.request_status[room] = KVPoll.Failed
+            try:
+                receiver.conclude_state = KVPoll.Failed
+            except Exception:
+                pass
 
     def _handle_node_failure(self, failed_bootstrap_addr: str):
         """Run common failure handling and retire only the failed generation.
@@ -641,6 +660,16 @@ class NixlKVManager(CommonKVManager):
             subscriber_tokens = handler.snapshot_wm_subscribers(bootstrap_info_groups)
 
         super()._handle_node_failure(failed_bootstrap_addr)
+
+        if handler is not None:
+            marked = handler.note_peer_gone(failed_bootstrap_addr)
+            if marked:
+                logger.warning(
+                    "[STAGING_DEFERRED_RECLAIM] node-failure %s: %d failed room(s) "
+                    "now reclaimable",
+                    failed_bootstrap_addr,
+                    marked,
+                )
 
         if subscriber_tokens and handler is not None:
             handler.unregister_wm_subscribers(
@@ -682,24 +711,61 @@ class NixlKVManager(CommonKVManager):
         try:
             room = int(msg[1].decode("ascii"))
             reason = msg[2].decode("utf-8", errors="replace") if len(msg) > 2 else ""
+            agent = msg[3].decode("ascii", errors="replace") if len(msg) > 3 else ""
+            engine_rank = int(msg[4].decode("ascii")) if len(msg) > 4 else -1
         except Exception:
             logger.warning("[STAGING_FAIL] malformed message %s", msg[:2])
             return
         # Not a "[STAGING_*]" invariant violation: the peer failed and told us,
         # so the room's extents are isolated and only the lost-capacity policy
         # can escalate (a prefill crash must not fail-stop this decode).
-        reason = (
-            f"prefill-transfer-failed room={room}: "
-            + reason.replace("[STAGING_", "[PREFILL_STAGING_")
+        reason = f"prefill-transfer-failed room={room}: " + reason.replace(
+            "[STAGING_", "[PREFILL_STAGING_"
         )
-        logger.warning("[STAGING_PREFILL_FAILED] %s", reason)
+        logger.warning("[STAGING_PREFILL_FAILED] %s agent=%s", reason, agent)
         handler = getattr(self, "_staging_handler", None)
-        if handler is not None and handler.is_staging_room(room):
-            handler.fail_staging_room(room, reason)
-            return
+        if handler is not None:
+            if handler.is_staging_room(room):
+                handler.fail_staging_room_from_peer(room, reason, agent, engine_rank)
+                return
+            if handler.note_peer_failure(room, agent, engine_rank):
+                # Room already released here; the report only completes the
+                # writer set of its deferred extents.
+                handler.sweep_deferred_reclaims()
+                return
         if room in self.request_status:
             self.record_failure(room, reason)
             self.update_status(room, KVPoll.Failed)
+            return
+        # The report can beat the decode's own registration of the room; keep
+        # it so the room fails as soon as it is registered.
+        pending = getattr(self, "_staging_pending_fail", None)
+        if pending is None:
+            pending = self._staging_pending_fail = {}
+        now = time.monotonic()
+        for stale in [r for r, (_, _, ts) in pending.items() if now - ts > 300.0]:
+            pending.pop(stale, None)
+        pending[room] = (reason, agent, now)
+        logger.warning(
+            "[STAGING_FAIL] room=%s not registered yet; holding the failure", room
+        )
+
+    def _report_room_stopped(self, room: int, reason: str) -> None:
+        """Tell decode this rank will not write ``room`` again. Called where
+        that is guaranteed: after the transfer worker failed the room, or when
+        it skips a chunk of an already failed room (chunks of a room are
+        processed sequentially on one worker, so nothing is in flight)."""
+        reported = getattr(self, "_staging_fail_reported", None)
+        if reported is None:
+            reported = self._staging_fail_reported = {}
+        now = time.monotonic()
+        if room in reported:
+            return
+        if len(reported) > 4096:
+            for stale in [r for r, ts in reported.items() if now - ts > 600.0]:
+                reported.pop(stale, None)
+        reported[room] = now
+        self._notify_decode_staging_fail(room, reason)
 
     def _notify_decode_staging_fail(self, room: int, reason: str) -> None:
         if not self.enable_staging:
@@ -708,16 +774,22 @@ class NixlKVManager(CommonKVManager):
             send_staging_fail,
         )
 
+        peers = self.transfer_infos.get(room) or getattr(
+            self, "_staging_room_peers", {}
+        ).get(room)
         try:
             notified = send_staging_fail(
                 room,
-                self.transfer_infos,
+                {room: peers} if peers else {},
                 self._staging_ctx.prefetch_sockets,
                 reason,
+                getattr(getattr(self, "agent", None), "name", "") or "",
+                int(getattr(getattr(self, "kv_args", None), "engine_rank", -1)),
             )
         except Exception:
             logger.exception("[STAGING_FAIL] notify failed room=%s", room)
             return
+        getattr(self, "_staging_room_peers", {}).pop(room, None)
         logger.warning(
             "[STAGING_FAIL] room=%s notified %s decode peer(s): %s",
             room,
@@ -779,6 +851,14 @@ class NixlKVManager(CommonKVManager):
             return
 
         room_infos = self.transfer_infos.get(room, {})
+        # Snapshot the decode peers: the scheduler's failure cleanup pops
+        # transfer_infos before a slower rank's transfer worker gets to report
+        # the room as stopped, and the report needs the peer endpoints.
+        cache = getattr(self, "_staging_room_peers", None)
+        if cache is None:
+            cache = self._staging_room_peers = {}
+        if room_infos:
+            cache[room] = dict(room_infos)
         needs_staging = any(
             not tinfo.is_dummy()
             and tinfo.agent_name in self.decode_kv_args_table
@@ -1247,6 +1327,12 @@ class NixlKVManager(CommonKVManager):
             room = kv_chunk.room
             try:
                 if self.check_status(room) == KVPoll.Failed:
+                    # Nothing of this room is in flight on this rank (its
+                    # chunks are serialized on this worker): tell decode it
+                    # may reclaim the room's extents.
+                    self._report_room_stopped(
+                        room, "room failed; skipping queued chunk"
+                    )
                     continue
 
                 if room not in self.transfer_infos:
@@ -1495,11 +1581,19 @@ class NixlKVManager(CommonKVManager):
                         self._clear_staging_send_ops(room)
                     continue
 
-                if kv_chunk.is_last_chunk:
+                if self.check_status(room) == KVPoll.Failed:
+                    # Failed (e.g. decode abort) while this chunk was in flight;
+                    # the chunk is now terminal, so this rank is quiescent.
+                    self._report_room_stopped(room, "room failed during transfer")
+                    if kv_chunk.is_last_chunk:
+                        self.transfer_infos.pop(room, None)
+                        self.req_to_decode_prefix_len.pop(room, None)
+                elif kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
                     # Drop per-room state on Success (parity with mooncake).
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
+                    getattr(self, "_staging_room_peers", {}).pop(room, None)
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
@@ -1518,7 +1612,7 @@ class NixlKVManager(CommonKVManager):
                 self.update_status(room, KVPoll.Failed)
                 # Tell decode before dropping the room's peer info so it fails
                 # the request now rather than at its waiting timeout.
-                self._notify_decode_staging_fail(room, str(e))
+                self._report_room_stopped(room, str(e))
                 if self.enable_staging:
                     self._clear_staging_sender_room(room)
 
