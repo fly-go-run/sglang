@@ -421,6 +421,15 @@ class _StagingSenderRoomState:
     last_chunk_id: Optional[int] = None
 
 
+# Outcomes of NixlKVManager._finish_staging_sender_chunk.
+_STAGING_ROOM_PENDING = 0  # registered chunks still outstanding
+_STAGING_ROOM_DONE = 1  # every registered chunk finished; Success published
+# The room failed (or the scheduler cleared it after a failure) while this
+# chunk was in flight: the chunk is terminal, this rank has nothing of the
+# room in flight any more and must tell decode so (see _report_room_stopped).
+_STAGING_ROOM_STOPPED = 2
+
+
 class NixlKVManager(CommonKVManager):
     def __init__(
         self,
@@ -765,7 +774,32 @@ class NixlKVManager(CommonKVManager):
             for stale in [r for r, ts in reported.items() if now - ts > 600.0]:
                 reported.pop(stale, None)
         reported[room] = now
+        self._pop_staging_stop_pending(room)
         self._notify_decode_staging_fail(room, reason)
+
+    # A room the scheduler cleared after a failure while this rank still had
+    # a chunk queued or in flight. The worker reports the room stopped when
+    # that chunk becomes terminal (see transfer_worker and
+    # _finish_staging_sender_chunk); until then no report may be sent.
+    def _mark_staging_stop_pending(self, room: int) -> None:
+        pending = getattr(self, "_staging_stop_pending", None)
+        if pending is None:
+            pending = self._staging_stop_pending = {}
+        now = time.monotonic()
+        if len(pending) > 4096:
+            for stale in [r for r, ts in pending.items() if now - ts > 600.0]:
+                pending.pop(stale, None)
+        pending[room] = now
+
+    def _staging_stop_is_pending(self, room: int) -> bool:
+        pending = getattr(self, "_staging_stop_pending", None)
+        return bool(pending) and room in pending
+
+    def _pop_staging_stop_pending(self, room: int) -> bool:
+        pending = getattr(self, "_staging_stop_pending", None)
+        if not pending:
+            return False
+        return pending.pop(room, None) is not None
 
     def _notify_decode_staging_fail(self, room: int, reason: str) -> None:
         if not self.enable_staging:
@@ -906,16 +940,27 @@ class NixlKVManager(CommonKVManager):
                 state.last_chunk_id = chunk_id
             state.registered_chunks.add(chunk_id)
 
-    def _finish_staging_sender_chunk(self, room: int, chunk_id: int) -> bool:
-        """Return true only when every registered chunk has finished."""
+    def _finish_staging_sender_chunk(self, room: int, chunk_id: int) -> int:
+        """Record one finished chunk of a staging room.
+
+        Returns _STAGING_ROOM_DONE when every registered chunk has finished
+        (Success is published atomically here), _STAGING_ROOM_STOPPED when the
+        room failed, or was cleared by the scheduler after a failure, while
+        this chunk was in flight, and _STAGING_ROOM_PENDING otherwise.
+        """
         with self._sender_room_lock:
             state = self._staging_sender_rooms.get(room)
             if state is None:
-                return False
+                if self._staging_stop_is_pending(room):
+                    return _STAGING_ROOM_STOPPED
+                return _STAGING_ROOM_PENDING
             status = self.request_status.get(room)
-            if status is None or status == KVPoll.Failed:
+            if status == KVPoll.Failed:
                 self._staging_sender_rooms.pop(room, None)
-                return False
+                return _STAGING_ROOM_STOPPED
+            if status is None:
+                self._staging_sender_rooms.pop(room, None)
+                return _STAGING_ROOM_PENDING
             state.completed_chunks.add(chunk_id)
             # add_transfer_request() registers on the scheduler thread before
             # queue.put(); workers therefore only complete registered ids.
@@ -923,12 +968,15 @@ class NixlKVManager(CommonKVManager):
                 state.completed_chunks
             ):
                 self.update_status(room, KVPoll.Transferring)
-                return False
+                return _STAGING_ROOM_PENDING
             self.update_status(room, KVPoll.Success)
             self.transfer_infos.pop(room, None)
             self.req_to_decode_prefix_len.pop(room, None)
             self._staging_sender_rooms.pop(room, None)
-            return True
+            # The peer snapshot exists for failure reports; a finished room
+            # never needs it (it grew without bound on the success path).
+            getattr(self, "_staging_room_peers", {}).pop(room, None)
+            return _STAGING_ROOM_DONE
 
     def _clear_staging_sender_room(self, room: int) -> None:
         with self._sender_room_lock:
@@ -1326,10 +1374,15 @@ class NixlKVManager(CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             try:
-                if self.check_status(room) == KVPoll.Failed:
+                if (
+                    self.check_status(room) == KVPoll.Failed
+                    or self._staging_stop_is_pending(room)
+                ):
                     # Nothing of this room is in flight on this rank (its
                     # chunks are serialized on this worker): tell decode it
-                    # may reclaim the room's extents.
+                    # may reclaim the room's extents. The second test covers a
+                    # room the scheduler already cleared after a failure (its
+                    # status is gone, see NixlKVSender.clear).
                     self._report_room_stopped(
                         room, "room failed; skipping queued chunk"
                     )
@@ -1565,10 +1618,18 @@ class NixlKVManager(CommonKVManager):
                     continue
 
                 if self.enable_staging:
-                    staging_room_done = self._finish_staging_sender_chunk(
+                    outcome = self._finish_staging_sender_chunk(
                         room, kv_chunk.chunk_id
                     )
-                    if not staging_room_done:
+                    if outcome == _STAGING_ROOM_STOPPED:
+                        # Failed (decode abort, a sibling rank's failure, ...)
+                        # while this chunk was in flight; the chunk is now
+                        # terminal, so this rank is quiescent for the room.
+                        self._report_room_stopped(
+                            room, "room failed during transfer"
+                        )
+                        continue
+                    if outcome != _STAGING_ROOM_DONE:
                         continue
                     # _finish_staging_sender_chunk() performs the status and
                     # room-dictionary transition atomically. Only NIXL staging
@@ -3389,13 +3450,38 @@ class NixlKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
-        with self.kv_mgr._sender_room_lock:
+        mgr = self.kv_mgr
+        room = self.bootstrap_room
+        # Failure paths (failure_exception, abort) reach clear() with one of
+        # these set; the success path has none of them.
+        failed = (
+            getattr(self, "_send_failed", False)
+            or getattr(self, "conclude_state", None) == KVPoll.Failed
+            or mgr.request_status.get(room) == KVPoll.Failed
+        )
+        report_stopped = False
+        with mgr._sender_room_lock:
+            if failed and getattr(mgr, "enable_staging", False):
+                # Once the room's status is gone the worker cannot see the
+                # failure any more, so decide here who reports this rank as
+                # stopped: nothing queued or in flight -> now; otherwise the
+                # worker, when the outstanding chunk becomes terminal.
+                state = mgr._staging_sender_rooms.get(room)
+                outstanding = state is not None and not set(
+                    getattr(state, "registered_chunks", ())
+                ).issubset(getattr(state, "completed_chunks", ()))
+                if outstanding:
+                    mgr._mark_staging_stop_pending(room)
+                else:
+                    report_stopped = True
             # CommonKVSender.clear() removes request_status/transfer_infos.
             # Holding the same lock as worker completion makes that removal a
             # terminal action rather than a window in which a late completion
             # can publish Success again.
             super().clear()
-            self.kv_mgr._staging_sender_rooms.pop(self.bootstrap_room, None)
+            mgr._staging_sender_rooms.pop(room, None)
+        if report_stopped:
+            mgr._report_room_stopped(room, "sender cleared after failure")
         if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
             self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
             self.kv_mgr._staging_ctx.prefetch_requested = {

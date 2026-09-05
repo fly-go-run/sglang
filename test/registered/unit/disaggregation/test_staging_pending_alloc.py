@@ -57,6 +57,21 @@ def _receiver():
     return receiver
 
 
+def _target_agent(leases=0, local_shared=0):
+    """Fake NIXL agent whose query_memory answers like nixlUcxEngine::queryMem."""
+
+    def query_memory(reg_list, backend, mem_type=None):
+        return [
+            {
+                "staged_writable_leases": str(leases),
+                "staged_local_shared_attachments": str(local_shared),
+            }
+            for _ in reg_list
+        ]
+
+    return SimpleNamespace(query_memory=MagicMock(side_effect=query_memory), backends={"UCX": 1})
+
+
 def _handler(allocator, rooms):
     handler = object.__new__(DecodeStagingHandler)
     handler.staging_allocator = allocator
@@ -86,6 +101,9 @@ def _handler(allocator, rooms):
         _staging_ctx=SimpleNamespace(room_bootstrap=room_bootstrap, room_receivers={}),
         record_failure=MagicMock(),
         update_status=MagicMock(),
+        kv_args=SimpleNamespace(gpu_id=0),
+        # No NIXL agent by default: deferred reclaim then has no target
+        # certificate and must fail closed (quarantine after the grace).
     )
     handler.fail_staging_room = MagicMock()
     handler._drain_scatter_bounded = MagicMock()
@@ -300,11 +318,15 @@ class TestStagingPendingAlloc(CustomTestCase):
         self.assertEqual(handler.pending_alloc_count(), 0)
         self.assertEqual(len(_rsp_messages(r1)), 1)
 
-    def _deferred_setup(self):
+    def _deferred_setup(self, agent="quiet"):
         from unittest.mock import patch
 
         size = _chunk_bytes()
         handler, rb = _handler(_allocator(size), [1, 2])
+        if agent == "quiet":
+            handler.kv_manager.agent = _target_agent(leases=0)
+        elif agent == "busy":
+            handler.kv_manager.agent = _target_agent(leases=1)
         _req(handler, rb, 1)
         _req(handler, rb, 2)  # queued: pool full
         alloc1 = handler._room_to_receiver[1].chunk_staging_infos[0][0]
@@ -371,23 +393,167 @@ class TestStagingPendingAlloc(CustomTestCase):
         self.assertEqual(handler.deferred_reclaim_count(), 0)
         self.assertEqual(handler._room_lifecycles[2].chunk_states[0], "PENDING_ALLOC")
 
-    def test_peer_gone_makes_deferred_extent_reclaimable(self):
+    def test_peer_gone_does_not_substitute_for_missing_writer_report(self):
+        # An HTTP health failure of the writer node is control-plane evidence
+        # only; a healthy rank of that node may still post writes.
         handler, rb, alloc1, patch = self._deferred_setup()
         allocator = handler.staging_allocator
-        with patch(
-            "sglang.srt.disaggregation.common.staging_handler.time.monotonic",
-            return_value=100.0,
-        ):
+        clock = "sglang.srt.disaggregation.common.staging_handler.time.monotonic"
+        with patch(clock, return_value=100.0):
             handler.fail_staging_room_from_peer(1, "rank0 failed", "p0", 0)
             # Room 1's writers live at 10.0.0.1:1001 (see _handler).
             self.assertEqual(handler.note_peer_gone("10.0.0.1:1001"), 1)
-        with patch(
-            "sglang.srt.disaggregation.common.staging_handler.time.monotonic",
-            return_value=106.0,
-        ):
+        with patch(clock, return_value=106.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.allocations)
+        self.assertNotIn(alloc1, allocator.quarantined_allocations)
+        self.assertEqual(handler._room_lifecycles[2].chunk_states[0], "PENDING_ALLOC")
+        with patch(clock, return_value=131.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+        self.assertEqual(handler.deferred_reclaim_count(), 0)
+
+    def test_target_lease_in_flight_holds_extent_until_certified_quiet(self):
+        # Both writers reported, but the local NIXL target still has a lease
+        # (a queued H2D copy) on the extent: the elapsed time proves nothing.
+        handler, rb, alloc1, patch = self._deferred_setup(agent="busy")
+        allocator = handler.staging_allocator
+        clock = "sglang.srt.disaggregation.common.staging_handler.time.monotonic"
+        with patch(clock, return_value=100.0):
+            handler.fail_staging_room_from_peer(1, "rank0 failed", "p0", 0)
+            self.assertTrue(handler.note_peer_failure(1, "p1", 1))
+        with patch(clock, return_value=107.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.allocations)
+        self.assertNotIn(alloc1, allocator.quarantined_allocations)
+        self.assertEqual(handler.deferred_reclaim_count(), 1)
+        self.assertEqual(handler._room_lifecycles[2].chunk_states[0], "PENDING_ALLOC")
+        # The copy finished: the next poll frees and serves the queued room.
+        handler.kv_manager.agent = _target_agent(leases=0)
+        with patch(clock, return_value=108.0):
             handler.sweep_deferred_reclaims()
         self.assertNotIn(alloc1, allocator.allocations)
+        self.assertEqual(handler.deferred_reclaim_count(), 0)
         self.assertEqual(handler._room_lifecycles[2].chunk_states[0], "WRITABLE")
+
+    def test_target_lease_still_writable_at_grace_quarantines(self):
+        handler, rb, alloc1, patch = self._deferred_setup(agent="busy")
+        allocator = handler.staging_allocator
+        clock = "sglang.srt.disaggregation.common.staging_handler.time.monotonic"
+        with patch(clock, return_value=100.0):
+            handler.fail_staging_room_from_peer(1, "rank0 failed", "p0", 0)
+            self.assertTrue(handler.note_peer_failure(1, "p1", 1))
+        with patch(clock, return_value=134.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.allocations)  # grace + one poll delay
+        with patch(clock, return_value=136.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+        self.assertEqual(handler.deferred_reclaim_count(), 0)
+
+    def test_no_target_certificate_fails_closed_to_quarantine(self):
+        # Older NIXL (no queryMem) or a query error: never free on time alone.
+        handler, rb, alloc1, patch = self._deferred_setup(agent=None)
+        allocator = handler.staging_allocator
+        clock = "sglang.srt.disaggregation.common.staging_handler.time.monotonic"
+        with patch(clock, return_value=100.0):
+            handler.fail_staging_room_from_peer(1, "rank0 failed", "p0", 0)
+            self.assertTrue(handler.note_peer_failure(1, "p1", 1))
+        with patch(clock, return_value=107.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.allocations)
+        self.assertNotIn(alloc1, allocator.quarantined_allocations)
+        with patch(clock, return_value=136.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+
+    def test_query_error_and_local_shared_path_count_as_no_certificate(self):
+        handler, rb, alloc1, patch = self._deferred_setup(agent=None)
+        raising = SimpleNamespace(query_memory=MagicMock(side_effect=RuntimeError("x")))
+        handler.kv_manager.agent = raising
+        self.assertIsNone(handler._target_writes_pending({alloc1}))
+        handler.kv_manager.agent = _target_agent(leases=0, local_shared=1)
+        self.assertTrue(handler._target_writes_pending({alloc1}))
+        handler.kv_manager.agent = _target_agent(leases=0)
+        self.assertFalse(handler._target_writes_pending({alloc1}))
+        # Extents are queried by their live GPU range on the decode's device.
+        args = handler.kv_manager.agent.query_memory.call_args.args
+        offset, size, _ = handler.staging_allocator.allocations[alloc1]
+        self.assertEqual(
+            args[0], [(handler.staging_allocator.base_ptr + offset, size, 0, "")]
+        )
+        self.assertEqual(args[1:], ("UCX", "VRAM"))
+
+    def test_invariant_violation_after_peer_failure_escalates_to_quarantine(self):
+        # handle_chunk_arrived finds a geometry violation under the lifecycle
+        # lock and calls fail_staging_room outside it; a STAGING_FAIL handled
+        # by another thread in that window must not downgrade the violation
+        # to a deferred (freeable) disposition.
+        handler, rb, alloc1, patch = self._deferred_setup()
+        allocator = handler.staging_allocator
+        clock = "sglang.srt.disaggregation.common.staging_handler.time.monotonic"
+
+        def interleaved(room, reason):
+            self.assertTrue(reason.startswith("[STAGING_GEOMETRY]"))
+            with patch(clock, return_value=100.0):
+                handler.fail_staging_room_from_peer(room, "transport deadline", "p0", 0)
+            DecodeStagingHandler.fail_staging_room(handler, room, reason)
+
+        handler.fail_staging_room = interleaved
+        handler.handle_chunk_arrived(1, 0, 100, 1, 0, "p0", {})
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+        self.assertEqual(handler.deferred_reclaim_count(), 0)
+        self.assertTrue(handler._room_lifecycles[1].quarantined)
+        # A late writer report cannot revive the entry or free the extent.
+        self.assertFalse(handler.note_peer_failure(1, "p1", 1))
+        with patch(clock, return_value=140.0):
+            handler.sweep_deferred_reclaims()
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+
+    def test_quarantine_between_defer_decision_and_registration_wins(self):
+        # _terminalize_room decides "deferred" under lifecycle.lock but
+        # registers in _defer_allocations after releasing it; an invariant
+        # quarantine landing in that window must leave no deferred entry.
+        handler, rb, alloc1, patch = self._deferred_setup()
+        allocator = handler.staging_allocator
+        original = handler._defer_allocations
+
+        def quarantine_then_register(room, decode_req, alloc_ids):
+            handler._terminalize_room(room, "[STAGING_GEOMETRY] injected")
+            original(room, decode_req, alloc_ids)
+
+        handler._defer_allocations = quarantine_then_register
+        handler.fail_staging_room_from_peer(1, "transport failed", "p0", 0)
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+        self.assertEqual(handler.deferred_reclaim_count(), 0)
+        self.assertEqual(allocator.invariant_counters.get("free_quarantined"), 0)
+
+    def test_certificate_requires_both_counts(self):
+        handler, rb, alloc1, patch = self._deferred_setup(agent=None)
+        for answer in (
+            {"staged_writable_leases": "0"},
+            {"staged_local_shared_attachments": "0"},
+            {"staged_writable_leases": "0", "staged_local_shared_attachments": "-1"},
+            {"staged_writable_leases": "x", "staged_local_shared_attachments": "0"},
+        ):
+            handler.kv_manager.agent = SimpleNamespace(
+                backends={"UCX": 1}, query_memory=MagicMock(return_value=[answer])
+            )
+            self.assertIsNone(handler._target_writes_pending({alloc1}), answer)
+
+    def test_peer_failure_after_invariant_quarantine_keeps_quarantine(self):
+        handler, rb, alloc1, patch = self._deferred_setup()
+        allocator = handler.staging_allocator
+        handler.fail_staging_room = DecodeStagingHandler.fail_staging_room.__get__(
+            handler
+        )
+        handler.fail_staging_room(1, "[STAGING_GEOMETRY] bad")
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+        handler.fail_staging_room_from_peer(1, "rank0 failed", "p0", 0)
+        self.assertEqual(handler.deferred_reclaim_count(), 0)
+        self.assertFalse(handler._room_lifecycles[1].deferred)
+        self.assertIn(alloc1, allocator.quarantined_allocations)
+        self.assertEqual(allocator.invariant_counters.get("free_quarantined"), 0)
 
     def test_invariant_violation_still_quarantines_immediately(self):
         handler, rb, alloc1, patch = self._deferred_setup()

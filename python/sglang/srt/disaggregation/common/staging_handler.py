@@ -47,11 +47,17 @@ STAGING_SCATTER_DRAIN_TIMEOUT_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_SCATTER_DRAIN_TIMEOUT_S", "5")
 )
 # Deferred reclaim of a failed room's staging extents (see
-# fail_staging_room_from_peer). Once every writer rank reported its failure
-# (it cancelled its transfers) or the writer's node is gone, the extents are
-# freed after a short delay that covers an H2D copy already in flight. If some
-# writer never reports, the extents are quarantined after the grace period
-# (must exceed the transport ACK deadline: 5 s x 5 attempts = 25 s).
+# fail_staging_room_from_peer). An extent is freed only when both hold:
+#   1. every writer rank reported that it stopped (its transfer handles are
+#      terminal, so it posts no new write), and
+#   2. the local NIXL target certifies that no staged lease can still write
+#      into the extent (no lease in REMOTE_RESERVED/REMOTE_H2D overlaps it;
+#      see nixlUcxEngine::queryMem). A writer's own failure report proves
+#      nothing about a target-side H2D copy that is already queued.
+# The free delay only spaces the certificate polls. Without both conditions
+# the extents are quarantined after the grace period (must exceed the
+# transport ACK deadline: 5 s x 5 attempts = 25 s). A control-plane health
+# failure of the writer node never authorizes a free.
 STAGING_DEFERRED_FREE_DELAY_S = float(
     os.environ.get("SGLANG_DISAGG_STAGING_DEFERRED_FREE_DELAY_S", "5")
 )
@@ -142,9 +148,15 @@ class _DeferredReclaim:
     # Writer slots (see handle_chunk_arrived) that reported they stopped.
     reported: set = dataclasses.field(default_factory=set)
     writer_addrs: set = dataclasses.field(default_factory=set)
+    # Diagnostic only: the writer node failed its health check. It does not
+    # authorize a free (the data plane may still be alive).
     peer_gone: bool = False
     first_ts: float = 0.0
     last_ts: float = 0.0
+    # Last answer of the target certificate: True = a lease can still write,
+    # False = certified quiet, None = no certificate available.
+    target_pending: Optional[bool] = None
+    wait_logged: bool = False
 
 
 class DecodeStagingHandler:
@@ -496,11 +508,19 @@ class DecodeStagingHandler:
     def _terminalize_room(
         self, room: int, reason: str, quarantine: bool = True
     ) -> set[int]:
-        """Close the scatter/allocation fence, then quarantine live allocations.
+        """Close the scatter/allocation fence, then isolate live allocations.
 
-        With ``quarantine=False`` (or once the room was already deferred) the
-        live allocations go to the deferred-reclaim table instead; see
-        fail_staging_room_from_peer.
+        ``quarantine=False`` (a peer-reported failure) parks the live
+        allocations in the deferred-reclaim table; see
+        fail_staging_room_from_peer. A later ordinary release of a deferred
+        room (reason ``room-release`` etc.) keeps them there. The disposition
+        only ever gets stricter: an invariant-violation reason
+        (``[STAGING_*]``, see _quarantine_is_invariant_violation) on a room
+        that was already deferred pulls its extents back out of that table
+        and quarantines them, and a peer report after a quarantine changes
+        nothing. Two control threads can race here (a STAGING_FAIL arriving
+        while handle_chunk_arrived is between its lock and fail_staging_room),
+        so the order of the two calls must not matter.
         """
         lifecycle = self._room_lifecycles.get(room)
         decode_req = self._room_to_decode_req.get(room)
@@ -508,22 +528,57 @@ class DecodeStagingHandler:
         if lifecycle is None or decode_req is None:
             return set()
         self.drop_pending_allocs(room)
+        escalate = quarantine and self._quarantine_is_invariant_violation(reason)
         with lifecycle.lock:
             lifecycle.terminal = True
-            if not quarantine:
+            if lifecycle.quarantined:
+                deferred = False
+            elif not quarantine:
                 lifecycle.deferred = True
-            deferred = lifecycle.deferred
+                deferred = True
+            elif lifecycle.deferred and not escalate:
+                deferred = True
+            else:
+                lifecycle.deferred = False
+                deferred = False
             alloc_ids = self._outstanding_alloc_ids(decode_req, receiver)
+            if (alloc_ids or escalate) and not deferred:
+                # Set before the deferred-table pop below: a peer-failure
+                # thread that already decided "deferred" but has not
+                # registered yet re-checks this flag under _deferred_lock.
+                lifecycle.quarantined = True
             if alloc_ids:
-                if not deferred:
-                    lifecycle.quarantined = True
                 for chunk_idx in lifecycle.chunk_states:
                     lifecycle.chunk_states[chunk_idx] = "TERMINAL"
         if deferred:
             self._defer_allocations(room, decode_req, alloc_ids)
-        else:
-            for alloc_id in alloc_ids:
-                self.staging_allocator.quarantine(alloc_id, reason)
+            return alloc_ids
+        if escalate:
+            # Escalation: extents already parked for deferred reclaim must be
+            # withheld, not freed, after an invariant violation. The sweep
+            # frees under _deferred_lock, so an entry is either still whole
+            # here or already gone (and its ids no longer in allocations).
+            with self._deferred_lock:
+                entry = self._deferred_reclaims.pop(room, None)
+            if entry is not None:
+                parked = {
+                    alloc_id
+                    for alloc_id in entry.alloc_ids
+                    if alloc_id in self.staging_allocator.allocations
+                }
+                if parked:
+                    logger.error(
+                        "[STAGING_DEFERRED_ESCALATE] room=%s quarantining %d "
+                        "deferred extent(s): %s",
+                        room,
+                        len(parked),
+                        reason,
+                    )
+                    alloc_ids = set(alloc_ids) | parked
+                    with lifecycle.lock:
+                        lifecycle.quarantined = True
+        for alloc_id in alloc_ids:
+            self.staging_allocator.quarantine(alloc_id, reason)
         return alloc_ids
 
     # ------------------------------------------------------------------
@@ -533,6 +588,20 @@ class DecodeStagingHandler:
     def _defer_allocations(self, room: int, decode_req, alloc_ids: set) -> None:
         now = time.monotonic()
         with self._deferred_lock:
+            # The disposition was decided under lifecycle.lock, which is not
+            # held here. If another thread quarantined the room in between
+            # (invariant violation), registering would leave a stale entry
+            # whose ids are already withheld; quarantine wins.
+            lifecycle = self._room_lifecycles.get(room)
+            if lifecycle is not None and lifecycle.quarantined:
+                return
+            alloc_ids = {
+                a
+                for a in alloc_ids
+                if a not in self.staging_allocator.quarantined_allocations
+            }
+            if not alloc_ids and room not in self._deferred_reclaims:
+                return
             entry = self._deferred_reclaims.get(room)
             if entry is None:
                 try:
@@ -564,9 +633,10 @@ class DecodeStagingHandler:
         """A prefill rank reported that it failed this room.
 
         Fence the room and fail the request now, but do not quarantine its
-        extents: the reporting rank cancelled its transfers, so once every
-        writer rank reported (or the writer node is gone) the extents are
-        safe to free. Returns False if the room is unknown here.
+        extents yet: they wait in the deferred-reclaim table until every
+        writer rank reported and the local NIXL target certifies that no
+        lease can still write them (see sweep_deferred_reclaims). Returns
+        False if the room is unknown here.
         """
         lifecycle = self._room_lifecycles.get(room)
         decode_req = self._room_to_decode_req.get(room)
@@ -603,8 +673,12 @@ class DecodeStagingHandler:
             return True
 
     def note_peer_gone(self, failed_bootstrap_addr: str) -> int:
-        """A prefill node disconnected: its rooms' extents can never be
-        written again, so mark matching deferred entries reclaimable."""
+        """A prefill node failed its HTTP health check. Recorded for
+        diagnostics only: a control-plane failure does not prove the data
+        plane stopped (a healthy rank of that node may still post writes), so
+        it never substitutes for the writers' own stop reports. Such rooms
+        end up quarantined after the grace period unless every writer
+        reports."""
         marked = 0
         with self._deferred_lock:
             for entry in self._deferred_reclaims.values():
@@ -624,42 +698,74 @@ class DecodeStagingHandler:
             return len(self._deferred_reclaims)
 
     def sweep_deferred_reclaims(self) -> None:
-        """Free extents whose writers all stopped; quarantine the rest after
-        the grace period. Safe from any thread; takes no lifecycle lock."""
+        """Free extents of failed rooms whose writers all reported stopped
+        and which the local NIXL target certifies quiet; quarantine the rest
+        after the grace period. Safe from any thread; takes no lifecycle
+        lock. Frees happen under _deferred_lock so an invariant-violation
+        escalation (_terminalize_room) never races a free."""
         if not getattr(self, "_deferred_reclaims", None):
             return
         now = time.monotonic()
-        to_free = []
+        freed_rooms = []
         to_quarantine = []
         with self._deferred_lock:
             for room, entry in list(self._deferred_reclaims.items()):
-                stopped = (
-                    entry.peer_gone or len(entry.reported) >= entry.expected_writers
-                )
+                stopped = len(entry.reported) >= entry.expected_writers
                 if stopped and now - entry.last_ts >= STAGING_DEFERRED_FREE_DELAY_S:
-                    to_free.append((room, entry))
-                    del self._deferred_reclaims[room]
-                elif now - entry.first_ts >= STAGING_DEFERRED_QUARANTINE_S:
+                    pending = self._target_writes_pending(entry.alloc_ids)
+                    entry.target_pending = pending
+                    if pending is False:
+                        freed = sum(
+                            1
+                            for a in entry.alloc_ids
+                            if self.staging_allocator.free(a)
+                        )
+                        del self._deferred_reclaims[room]
+                        freed_rooms.append((room, entry, freed))
+                        continue
+                    if not entry.wait_logged:
+                        entry.wait_logged = True
+                        logger.warning(
+                            "[STAGING_DEFERRED_WAIT] room=%s writers reported "
+                            "%d/%d but %s; holding %d extent(s)",
+                            room,
+                            len(entry.reported),
+                            entry.expected_writers,
+                            (
+                                "a target lease can still write them"
+                                if pending
+                                else "NIXL gives no target certificate"
+                            ),
+                            len(entry.alloc_ids),
+                        )
+                deadline = entry.first_ts + STAGING_DEFERRED_QUARANTINE_S
+                if stopped:
+                    # A late but complete writer set still gets one poll.
+                    deadline += STAGING_DEFERRED_FREE_DELAY_S
+                if now >= deadline:
                     to_quarantine.append((room, entry))
                     del self._deferred_reclaims[room]
-        freed_any = False
-        for room, entry in to_free:
-            freed = sum(1 for a in entry.alloc_ids if self.staging_allocator.free(a))
-            freed_any |= freed > 0
+        for room, entry, freed in freed_rooms:
             logger.warning(
                 "[STAGING_DEFERRED_RECLAIM] room=%s freed=%d/%d extents "
-                "(writers reported %d/%d peer_gone=%s)",
+                "(writers reported %d/%d, target certified quiet)",
                 room,
                 freed,
                 len(entry.alloc_ids),
                 len(entry.reported),
                 entry.expected_writers,
-                entry.peer_gone,
             )
         for room, entry in to_quarantine:
+            if entry.target_pending is None:
+                target = "unverified"
+            elif entry.target_pending:
+                target = "pending"
+            else:
+                target = "quiet"
             reason = (
                 f"deferred-reclaim-timeout room={room} writers reported "
-                f"{len(entry.reported)}/{entry.expected_writers}"
+                f"{len(entry.reported)}/{entry.expected_writers} "
+                f"target={target} peer_gone={entry.peer_gone}"
             )
             for a in entry.alloc_ids:
                 self.staging_allocator.quarantine(a, reason)
@@ -669,8 +775,85 @@ class DecodeStagingHandler:
                 len(entry.alloc_ids),
                 reason,
             )
-        if freed_any:
+        if any(freed for _, _, freed in freed_rooms):
             self._service_pending_allocs()
+
+    def _log_no_certificate_once(self, why: str) -> None:
+        if getattr(self, "_no_certificate_logged", False):
+            return
+        self._no_certificate_logged = True
+        logger.error(
+            "[STAGING_DEFERRED_NO_CERTIFICATE] %s; failed rooms' extents will "
+            "be quarantined after %.0fs instead of reused (safe, costs capacity)",
+            why,
+            STAGING_DEFERRED_QUARANTINE_S,
+        )
+
+    def _target_writes_pending(self, alloc_ids) -> Optional[bool]:
+        """Ask the local NIXL target whether a staged lease can still write
+        into any of these extents (nixlUcxEngine::queryMem). True: yes.
+        False: certified quiet. None: no certificate (older NIXL without the
+        query, backend mismatch, query error); callers must treat None as
+        pending. Called under _deferred_lock; takes allocator.lock inside."""
+        agent = getattr(self.kv_manager, "agent", None)
+        query = getattr(agent, "query_memory", None)
+        if not callable(query):
+            self._log_no_certificate_once("NIXL agent has no query_memory")
+            return None
+        allocator = self.staging_allocator
+        kv_args = getattr(self.kv_manager, "kv_args", None)
+        gpu_id = int(getattr(kv_args, "gpu_id", 0) or 0)
+        descs = []
+        with allocator.lock:
+            for alloc_id in alloc_ids:
+                info = allocator.allocations.get(alloc_id)
+                if info is None:
+                    continue
+                descs.append((allocator.base_ptr + info[0], info[1], gpu_id, ""))
+        if not descs:
+            return False
+        backends = getattr(agent, "backends", None)
+        if isinstance(backends, dict) and backends:
+            backend = "UCX" if "UCX" in backends else (
+                next(iter(backends)) if len(backends) == 1 else None
+            )
+        else:
+            backend = "UCX"
+        if backend is None:
+            self._log_no_certificate_once(
+                f"cannot pick the staged backend among {sorted(backends)}"
+            )
+            return None
+        try:
+            resp = query(descs, backend, "VRAM")
+        except Exception as exc:
+            self._log_no_certificate_once(f"query_memory failed: {exc!r}")
+            return None
+        if resp is None or len(resp) != len(descs):
+            self._log_no_certificate_once("query_memory gave no per-extent answer")
+            return None
+        pending = False
+        for info in resp:
+            if not info:
+                self._log_no_certificate_once(
+                    "query_memory answer is empty (backend without queryMem?)"
+                )
+                return None
+            try:
+                leases = int(info["staged_writable_leases"])
+                local_shared = int(info["staged_local_shared_attachments"])
+            except (KeyError, TypeError, ValueError, AttributeError):
+                self._log_no_certificate_once(
+                    "query_memory answer lacks staged_writable_leases / "
+                    "staged_local_shared_attachments"
+                )
+                return None
+            if leases < 0 or local_shared < 0:
+                self._log_no_certificate_once("negative count in query_memory answer")
+                return None
+            if leases > 0 or local_shared > 0:
+                pending = True
+        return pending
 
     def _drain_scatter_bounded(self, room: int) -> None:
         """Wait briefly for claimed scatter without an unbounded synchronize."""

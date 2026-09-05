@@ -649,6 +649,82 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.transfer_infos)
         self.assertIn(room, mgr.req_to_decode_prefix_len)
 
+    def _make_staging_manager(self, room, abort_mid_transfer):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingContext,
+        )
+
+        mgr = self._make_manager(room)
+        mgr.enable_staging = True
+        mgr._staging_ctx = PrefillStagingContext()
+        mgr._staging_room_peers = {room: dict(mgr.transfer_infos[room])}
+        mgr._register_staging_sender_chunk(room, 0, True)
+        mgr.send_aux = MagicMock(return_value="aux")
+        mgr.agent.release_xfer_handle = MagicMock()
+        if not abort_mid_transfer:
+            mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+        mgr._report_room_stopped = MagicMock()
+        return mgr
+
+    def test_staging_success_releases_cached_peer_snapshot(self):
+        room = 23
+        mgr = self._make_staging_manager(room, abort_mid_transfer=False)
+
+        self._run_worker_once(mgr, self._make_chunk(room, [], is_last_chunk=True))
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Success)
+        self.assertNotIn(room, mgr._staging_room_peers)
+        self.assertNotIn(room, mgr.transfer_infos)
+        mgr._report_room_stopped.assert_not_called()
+
+    def test_staging_abort_during_last_transfer_reports_stopped(self):
+        # The room is marked Failed while the last chunk's handle is in
+        # flight; when the handle completes this rank has nothing of the room
+        # in flight and must say so (decode's deferred reclaim waits for it).
+        room = 24
+        mgr = self._make_staging_manager(room, abort_mid_transfer=True)
+
+        self._run_worker_once(mgr, self._make_chunk(room, [], is_last_chunk=True))
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        mgr._report_room_stopped.assert_called_once()
+        self.assertIn(room, mgr._staging_room_peers)  # kept for the report
+
+    def test_staging_room_cleared_while_chunk_in_flight_reports_when_done(self):
+        # NixlKVSender.clear() after a failure removed the room's status and
+        # fence while this chunk was in flight; the worker still reports.
+        room = 25
+        mgr = self._make_staging_manager(room, abort_mid_transfer=False)
+        mgr._staging_sender_rooms.pop(room)
+        mgr.request_status.pop(room)
+        mgr._mark_staging_stop_pending(room)
+
+        self._run_worker_once(mgr, self._make_chunk(room, [], is_last_chunk=True))
+
+        mgr._report_room_stopped.assert_called_once()
+        self.assertNotIn(room, mgr.request_status)
+
+    def test_queued_chunk_of_cleared_failed_room_reports_stopped(self):
+        room = 26
+        mgr = self._make_staging_manager(room, abort_mid_transfer=False)
+        mgr.request_status.pop(room)
+        mgr.transfer_infos.pop(room)
+        mgr._mark_staging_stop_pending(room)
+        mgr.send_aux = MagicMock(side_effect=AssertionError("must not transfer"))
+
+        self._run_worker_once(mgr, self._make_chunk(room, [], is_last_chunk=True))
+
+        mgr._report_room_stopped.assert_called_once()
+
+    def test_stop_pending_mark_is_consumed_by_the_report(self):
+        room = 27
+        mgr = self._make_manager(room)
+        mgr.enable_staging = False
+        mgr._mark_staging_stop_pending(room)
+        self.assertTrue(mgr._staging_stop_is_pending(room))
+        mgr._report_room_stopped(room, "x")
+        self.assertFalse(mgr._staging_stop_is_pending(room))
+
 
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
